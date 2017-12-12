@@ -1,4 +1,4 @@
-/* Copyright (c) 2017. TIG developer. */
+# Copyright (c) 2017. TIG developer.
 
 ifeq ($(RTE_SDK),)
 $(error "Please define RTE_SDK environment variable")

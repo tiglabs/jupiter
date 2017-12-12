@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Jupiter is a high-performance 4-layer network load balance service bashed on DPDK. It supports TCP and UDP packet forwarding in FULLNAT mode. The load balancing algorithms supported by jupiter include [consistent hashing](https://www.codeproject.com/Articles/56138/Consistent-hashing), rr, lc.
+Jupiter is a high-performance 4-layer network load balance service based on DPDK. It supports TCP and UDP packet forwarding in FULLNAT mode. The load balancing algorithms supported by jupiter include [consistent hashing](https://www.codeproject.com/Articles/56138/Consistent-hashing), rr, lc.
 
 * Support TCP, UDP protocol
 * Support session maintenance for application
