@@ -1,4 +1,4 @@
-/* Copyright (c) 2017. TIG developer. */
+# Copyright (c) 2017. TIG developer.
 
 ifdef V
 Q =
