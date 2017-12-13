@@ -48,7 +48,7 @@ struct lb_virt_service {
     uint8_t proto_type;
     uint8_t deleted;             /* 是否被删除 */
     uint64_t conn_expire_period; /* 连接老化时间周期 */
-    uint32_t max_conns;          /* 支持的活动连接数上限 */
+    int32_t max_conns;           /* 支持的活动连接数上限 */
     rte_atomic32_t active_conns; /* 活动连接数 */
     rte_atomic32_t refcnt; /* 引用计数，为0时，执行内存释放 */
     const struct lb_scheduler *sched; /* 调度器 */
