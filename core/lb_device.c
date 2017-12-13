@@ -1,5 +1,9 @@
 /* Copyright (c) 2017. TIG developer. */
 
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+
 #include <stdint.h>
 
 #include <rte_bus_pci.h>
@@ -58,6 +62,29 @@ kni_config_network_interface(__attribute__((unused)) uint16_t port_id,
     return 0;
 }
 
+static int
+__kni_macaddr_get(const char *name, struct ether_addr *ha) {
+    int fd;
+    struct ifreq req;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    strncpy(req.ifr_name, name, IFNAMSIZ);
+    if (ioctl(fd, SIOCGIFHWADDR, &req) < 0) {
+        return -1;
+    }
+    ha->addr_bytes[0] = req.ifr_hwaddr.sa_data[0];
+    ha->addr_bytes[1] = req.ifr_hwaddr.sa_data[1];
+    ha->addr_bytes[2] = req.ifr_hwaddr.sa_data[2];
+    ha->addr_bytes[3] = req.ifr_hwaddr.sa_data[3];
+    ha->addr_bytes[4] = req.ifr_hwaddr.sa_data[4];
+    ha->addr_bytes[5] = req.ifr_hwaddr.sa_data[5];
+    return 0;
+}
+
 static void
 __netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mempool) {
     struct netdev_config *cfg = &(lb_cfg->netdev);
@@ -86,6 +113,10 @@ __netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mempool) {
     dev->kni = rte_kni_alloc(mempool, &conf, &ops);
     if (!dev->kni) {
         rte_exit(EXIT_FAILURE, "Create KNI device failed.\n");
+    }
+
+    if (__kni_macaddr_get(conf.name, &dev->ha) < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot get KNI mac address.\n");
     }
 
     /* config kni ip */
@@ -305,7 +336,6 @@ __netdev_init_hw_info(struct lb_net_device *dev) {
     } else {
         dev->ntuple_filter_support = 0;
     }
-    rte_eth_macaddr_get(port_id, &dev->ha);
     rte_eth_dev_get_mtu(port_id, &dev->mtu);
     if (cfg->enable_tx_offload) {
         __netdev_enable_tx_offload(dev);
@@ -373,6 +403,9 @@ __netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
     if (rte_eth_dev_start(dev->dev_id) < 0) {
         rte_exit(EXIT_FAILURE, "Net device start failed.\n");
     }
+
+    rte_eth_promiscuous_enable(dev->dev_id);
+
     rte_eth_link_get_nowait(dev->dev_id, &eth_link);
     dev->link_status = eth_link.link_status;
     RTE_LOG(INFO, LB, "port%" PRIu32 " (%" PRIu32 " Gbps) %s\n", dev->dev_id,
