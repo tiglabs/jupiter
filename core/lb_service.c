@@ -385,12 +385,15 @@ virt_service_max_conn_cmd_cb(int fd, char *argv[], int argc) {
         return;
     }
     if (argc == 2) {
-        unixctl_command_reply(fd, "max-conns: %u\n", virt_srv->max_conns);
+        unixctl_command_reply(fd, "max-conns: %d\n", virt_srv->max_conns);
         return;
     }
     if (parser_read_uint32(&val, argv[2]) < 0) {
         unixctl_command_reply_error(fd, "Invalid value: %s.\n", argv[2]);
         return;
+    }
+    if (val > INT32_MAX) {
+        val = INT32_MAX;
     }
     thread_write_lock();
     virt_srv->max_conns = val;
