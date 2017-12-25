@@ -69,10 +69,10 @@ rte_rwlock_t lb_thread_rwlock = RTE_RWLOCK_INITIALIZER;
 
 static int
 master_thread(__attribute__((unused)) void *arg) {
+    struct lb_net_device *dev = lb_netdev;
     uint32_t lcore_id = rte_lcore_id();
-    uint16_t txq_id = lb_netdev->lcore_to_txq[lcore_id];
-    struct rte_eth_dev_tx_buffer *tx_buffer = lb_netdev->tx_buffer[lcore_id];
-    struct rte_kni *kni = lb_netdev->kni;
+    uint16_t txq_id = dev->lcore_to_txq[lcore_id];
+    struct rte_eth_dev_tx_buffer *tx_buffer = dev->tx_buffer[lcore_id];
     struct rte_mbuf *rx_pkts[PKT_MAX_BURST];
     uint32_t nb_pkts, i;
     static uint32_t loop_count = 0;
@@ -91,12 +91,11 @@ master_thread(__attribute__((unused)) void *arg) {
         }
 
         /* doing kni */
-        nb_pkts = rte_kni_rx_burst(kni, rx_pkts, PKT_MAX_BURST);
+        nb_pkts = rte_eth_rx_burst(dev->kni_portid, 0, rx_pkts, PKT_MAX_BURST);
         for (i = 0; i < nb_pkts; ++i) {
-            rte_eth_tx_buffer(0, txq_id, tx_buffer, rx_pkts[i]);
+            rte_eth_tx_buffer(dev->phy_portid, txq_id, tx_buffer, rx_pkts[i]);
         }
-        rte_eth_tx_buffer_flush(0, txq_id, tx_buffer);
-        rte_kni_handle_request(kni);
+        rte_eth_tx_buffer_flush(dev->phy_portid, txq_id, tx_buffer);
     }
     return 0;
 }
@@ -105,7 +104,7 @@ static void
 kni_packet_event_cb(__attribute__((unused)) unsigned snd_lcoreid, void *param) {
     struct rte_mbuf *mbuf = param;
 
-    if (rte_kni_tx_burst(lb_netdev->kni, &mbuf, 1) != 1) {
+    if (rte_eth_tx_burst(lb_netdev->kni_portid, 0, &mbuf, 1) != 1) {
         rte_pktmbuf_free(mbuf);
     }
 }
@@ -115,7 +114,7 @@ arp_packet_event_cb(__attribute__((unused)) unsigned snd_lcoreid, void *param) {
     struct rte_mbuf *mbuf = param;
 
     lb_arp_packet_recv(mbuf);
-    if (rte_kni_tx_burst(lb_netdev->kni, &mbuf, 1) != 1) {
+    if (rte_eth_tx_burst(lb_netdev->kni_portid, 0, &mbuf, 1) != 1) {
         rte_pktmbuf_free(mbuf);
     }
 }

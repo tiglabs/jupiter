@@ -25,10 +25,6 @@ ifeq ($(tooldir),)
 tooldir = /usr/local/jupiter/tool
 endif
 
-ifeq ($(kmoddir),)
-kmoddir = /usr/local/jupiter/kmod
-endif
-
 ifeq ($(confdir),)
 confdir = /usr/local/jupiter
 endif
@@ -43,8 +39,9 @@ dpdk:
 	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET) T=$(RTE_TARGET) config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MACHINE=).*,\1$(machine),' $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_APP_TEST=).*,\1n,'         $(RTE_TARGET)/.config
+	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_EAL_IGB_UIO=).*,\1n,'      $(RTE_TARGET)/.config
+	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_KNI_KMOD=).*,\1n,'         $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_LIBRTE_PMD_PCAP=).*,\1y,'  $(RTE_TARGET)/.config
-	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_KNI_KMOD_ETHTOOL=).*,\1n,' $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET)
 
 .PHONY: jupiter
@@ -64,10 +61,6 @@ install:
 	$(Q)test -d $(DESTDIR)/$(tooldir) || mkdir -p $(DESTDIR)/$(tooldir)
 	$(Q)cp -a $(RTE_SDK)/usertools/cpu_layout.py $(DESTDIR)/$(tooldir)/cpu_layout.py
 	$(Q)cp -a $(RTE_SDK)/usertools/dpdk-devbind.py $(DESTDIR)/$(tooldir)/dpdk-devbind.py
-	
-	$(Q)test -d $(DESTDIR)/$(kmoddir) || mkdir -p $(DESTDIR)/$(kmoddir)
-	$(Q)cp -a $(RTE_SDK)/$(RTE_TARGET)/kmod/igb_uio.ko $(DESTDIR)/$(kmoddir)/igb_uio.ko
-	$(Q)cp -a $(RTE_SDK)/$(RTE_TARGET)/kmod/rte_kni.ko $(DESTDIR)/$(kmoddir)/rte_kni.ko
 
 	$(Q)test -d $(DESTDIR)/$(confdir) || mkdir -p $(DESTDIR)/$(confdir)
 	$(Q)cp -a jupiter.cfg $(DESTDIR)/$(confdir)
@@ -81,8 +74,6 @@ uninstall:
 	$(Q)$(if test -d $(DESTDIR)/$(bindir)/jupiter-pdump, rm -rf $(DESTDIR)/$(bindir)/jupiter-pdump,)
 	$(Q)$(if test -d $(DESTDIR)/$(tooldir)/cpu_layout.py, rm -rf $(DESTDIR)/$(tooldir)/cpu_layout.py,)
 	$(Q)$(if test -d $(DESTDIR)/$(tooldir)/dpdk-devbind.py, rm -rf $(DESTDIR)/$(tooldir)/dpdk-devbind.py,)
-	$(Q)$(if test -d $(DESTDIR)/$(kmoddir)/igb_uio.ko, rm -rf $(DESTDIR)/$(kmoddir)/igb_uio.ko,)
-	$(Q)$(if test -d $(DESTDIR)/$(kmoddir)/rte_kni.ko, rm -rf $(DESTDIR)/$(kmoddir)/rte_kni.ko,)
 	$(Q)$(if test -d $(DESTDIR)/$(confdir)/jupiter.cfg, rm -rf $(DESTDIR)/$(confdir)/jupiter.cfg,)
 	@echo ================== Uninstallation in $(DESTDIR)/ complete
 

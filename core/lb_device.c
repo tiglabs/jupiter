@@ -6,11 +6,10 @@
 
 #include <stdint.h>
 
-#include <rte_bus_pci.h>
 #include <rte_cycles.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
-#include <rte_kni.h>
+#include <rte_ether.h>
 #include <rte_malloc.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
@@ -25,247 +24,50 @@
 struct rte_mempool *lb_pktmbuf_pool;
 struct lb_net_device *lb_netdev;
 
-static int
-netdev_filter_ip_add(uint16_t ifid, uint32_t dst_ip, uint16_t rxq_id) {
-    struct rte_eth_ntuple_filter filter = {
-        .flags = RTE_5TUPLE_FLAGS,
-        .dst_ip = dst_ip,
-        .dst_ip_mask = UINT32_MAX, /* Enable */
-        .src_ip = 0,
-        .src_ip_mask = 0, /* Disable */
-        .dst_port = 0,
-        .dst_port_mask = 0, /* Disable */
-        .src_port = 0,
-        .src_port_mask = 0, /* Disable */
-        .proto = 0,
-        .proto_mask = 0, /* Disable */
-        .tcp_flags = 0,
-        .priority = 1, /* Lowest */
-        .queue = rxq_id,
-    };
-
-    return rte_eth_dev_filter_ctrl(ifid, RTE_ETH_FILTER_NTUPLE,
-                                   RTE_ETH_FILTER_ADD, &filter);
-}
-
-static int
-kni_change_mtu(__attribute__((unused)) uint16_t port_id,
-               __attribute__((unused)) unsigned new_mtu) {
-    RTE_LOG(DEBUG, LB, "unsupport change mtu.\n");
-    return 0;
-}
-
-static int
-kni_config_network_interface(__attribute__((unused)) uint16_t port_id,
-                             __attribute__((unused)) uint8_t if_up) {
-    RTE_LOG(DEBUG, LB, "unsupport config network interface.\n");
-    return 0;
-}
-
-static int
-__kni_macaddr_get(const char *name, struct ether_addr *ha) {
-    int fd;
-    struct ifreq req;
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
+static void
+__tx_offload_enabled(struct lb_net_device *dev) {
+    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_IPV4_CKSUM) {
+        dev->tx_ol_flags |= LB_TX_OL_IPV4_CKSUM;
+        RTE_LOG(INFO, LB, "Hardware Ip checksum enable.\n");
     }
 
-    strncpy(req.ifr_name, name, IFNAMSIZ);
-    if (ioctl(fd, SIOCGIFHWADDR, &req) < 0) {
-        return -1;
+    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_UDP_CKSUM) {
+        dev->tx_ol_flags |= LB_TX_OL_UDP_CKSUM;
+        RTE_LOG(INFO, LB, "Hardware Udp checksum enable.\n");
     }
-    ha->addr_bytes[0] = req.ifr_hwaddr.sa_data[0];
-    ha->addr_bytes[1] = req.ifr_hwaddr.sa_data[1];
-    ha->addr_bytes[2] = req.ifr_hwaddr.sa_data[2];
-    ha->addr_bytes[3] = req.ifr_hwaddr.sa_data[3];
-    ha->addr_bytes[4] = req.ifr_hwaddr.sa_data[4];
-    ha->addr_bytes[5] = req.ifr_hwaddr.sa_data[5];
-    return 0;
+
+    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_TCP_CKSUM) {
+        dev->tx_ol_flags |= LB_TX_OL_TCP_CKSUM;
+        RTE_LOG(INFO, LB, "Hardware Tcp checksum enable.\n");
+    }
 }
 
 static void
-__netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mempool) {
-    struct netdev_config *cfg = &(lb_cfg->netdev);
-    struct rte_kni_conf conf;
+__netdev_init_hw_info(struct lb_net_device *dev) {
+    const struct netdev_config *cfg = &lb_cfg->netdev;
     struct rte_eth_dev_info dev_info;
-    struct rte_kni_ops ops;
+    uint16_t port_id = dev->phy_portid;
 
-    memset(&conf, 0, sizeof(struct rte_kni_conf));
-    snprintf(conf.name, RTE_KNI_NAMESIZE, "%s%d", cfg->name_prefix,
-             dev->dev_id);
-    conf.core_id = rte_get_master_lcore();
-    conf.force_bind = 1;
-    conf.group_id = dev->dev_id;
-    conf.mbuf_size = RTE_MBUF_DEFAULT_DATAROOM;
-
-    memset(&dev_info, 0, sizeof(dev_info));
-    rte_eth_dev_info_get(dev->dev_id, &dev_info);
-    conf.addr = dev_info.pci_dev->addr;
-    conf.id = dev_info.pci_dev->id;
-
-    ops.port_id = dev->dev_id;
-    ops.change_mtu = kni_change_mtu;
-    ops.config_network_if = kni_config_network_interface;
-
-    rte_kni_init(1);
-    dev->kni = rte_kni_alloc(mempool, &conf, &ops);
-    if (!dev->kni) {
-        rte_exit(EXIT_FAILURE, "Create KNI device failed.\n");
+    /* Net dev default info */
+    rte_eth_dev_info_get(port_id, &dev_info);
+    dev->rx_offload_capa = dev_info.rx_offload_capa;
+    dev->tx_offload_capa = dev_info.tx_offload_capa;
+    dev->max_rx_queues = dev_info.max_rx_queues;
+    dev->max_tx_queues = dev_info.max_tx_queues;
+    dev->max_rx_desc = dev_info.rx_desc_lim.nb_max;
+    dev->max_tx_desc = dev_info.tx_desc_lim.nb_max;
+    dev->nb_rx_desc = RTE_MIN(cfg->rxq_desc_num, dev->max_rx_desc);
+    dev->nb_tx_desc = RTE_MIN(cfg->txq_desc_num, dev->max_tx_desc);
+    if (rte_eth_dev_filter_supported(port_id, RTE_ETH_FILTER_NTUPLE) == 0) {
+        dev->ntuple_filter_support = 1;
+    } else {
+        dev->ntuple_filter_support = 0;
     }
-
-    if (__kni_macaddr_get(conf.name, &dev->ha) < 0) {
-        rte_exit(EXIT_FAILURE, "Cannot get KNI mac address.\n");
+    rte_eth_dev_get_mtu(port_id, &dev->mtu);
+    if (cfg->enable_tx_offload) {
+        __tx_offload_enabled(dev);
     }
-
-    /* config kni ip */
-    dev->ip = cfg->kni_ip;
-    dev->netmask = cfg->kni_netmask;
-    dev->gw = cfg->kni_gateway;
-}
-
-static void
-tx_buffer_callback(struct rte_mbuf **pkts, uint16_t unsend, void *userdata) {
-    uint16_t i;
-    struct lb_net_device *dev = userdata;
-
-    for (i = 0; i < unsend; i++) {
-        rte_pktmbuf_free(pkts[i]);
-    }
-    dev->tx_dropped[rte_lcore_id()] += unsend;
-}
-
-static void
-__netdev_init_tx_buffer(struct lb_net_device *dev) {
-    uint32_t lcore_id;
-
-    RTE_LCORE_FOREACH(lcore_id) {
-        dev->tx_buffer[lcore_id] =
-            rte_zmalloc("tx-buffer", RTE_ETH_TX_BUFFER_SIZE(PKT_MAX_BURST), 0);
-        if (!dev->tx_buffer[lcore_id]) {
-            rte_exit(EXIT_FAILURE, "Create tx-buffer failed.\n");
-        }
-        rte_eth_tx_buffer_init(dev->tx_buffer[lcore_id], PKT_MAX_BURST);
-        rte_eth_tx_buffer_set_err_callback(dev->tx_buffer[lcore_id],
-                                           tx_buffer_callback, dev);
-    }
-}
-
-static struct rte_ring *
-__local_port_init(const char *name, uint16_t min_port, uint16_t max_port) {
-    struct rte_ring *ports;
-    uint16_t port;
-    int ret;
-
-    ports = rte_ring_create(name, 65536, rte_socket_id(),
-                            RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (!ports) {
-        rte_exit(EXIT_FAILURE, "Cannot create ring %s for local ports: %s\n",
-                 name, rte_strerror(rte_errno));
-    }
-    for (port = min_port; port != max_port; port++) {
-        ret = rte_ring_sp_enqueue(ports,
-                                  (void *)(uintptr_t)rte_cpu_to_be_16(port));
-        if (ret != 0) {
-            rte_exit(EXIT_FAILURE, "Cannot put port to ring %s: %s\n", name,
-                     rte_strerror(rte_errno));
-        }
-    }
-    return ports;
-}
-
-static void
-__local_ipv4_addr_init(struct lb_local_ipv4_addr *addr, uint32_t ip,
-                       uint16_t rxq_id, uint16_t min_port, uint16_t max_port) {
-    char name[RTE_RING_NAMESIZE];
-
-    addr->ip = ip;
-    addr->rxq_id = rxq_id;
-    snprintf(name, RTE_RING_NAMESIZE, "tcp-ports%p", addr);
-    addr->ports[LB_PROTO_TCP] = __local_port_init(name, min_port, max_port);
-    snprintf(name, RTE_RING_NAMESIZE, "udp-ports%p", addr);
-    addr->ports[LB_PROTO_UDP] = __local_port_init(name, min_port, max_port);
-}
-
-static inline uint32_t
-__rxq_to_lcore(uint16_t rxq_id) {
-    unsigned lcore_id;
-
-    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        if (lb_netdev->lcore_to_rxq[lcore_id] == rxq_id) {
-            return lcore_id;
-        }
-    }
-    return RTE_MAX_LCORE;
-}
-
-static void
-__netdev_init_local_ipaddr(struct lb_net_device *dev) {
-    struct netdev_config *cfg = &(lb_cfg->netdev);
-    uint32_t lip_min_count_percore;
-    uint32_t lip_idx = 0;
-    uint32_t lcore_id;
-    uint16_t rxq_id;
-
-    if (cfg->local_ip_count < rte_lcore_count() - 1) {
-        rte_exit(EXIT_FAILURE,
-                 "The number of local ipv4 address (%u) is less than "
-                 "the number of worker thread (%u).\n",
-                 cfg->local_ip_count, rte_lcore_count() - 1);
-    }
-    lip_min_count_percore = cfg->local_ip_count / (rte_lcore_count() - 1);
-    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        struct lb_local_ipv4_addr *addrs;
-        uint32_t i;
-
-        addrs = rte_calloc(NULL, lip_min_count_percore + 1,
-                           sizeof(struct lb_local_ipv4_addr), 0);
-        if (!addrs) {
-            rte_exit(EXIT_FAILURE,
-                     "Cannot alloc memory for local ipv4 address.\n");
-        }
-        rxq_id = dev->lcore_to_rxq[lcore_id];
-        for (i = 0; i < lip_min_count_percore; ++i) {
-            __local_ipv4_addr_init(&addrs[i], cfg->local_ips[lip_idx], rxq_id,
-                                   cfg->l4_port_min, cfg->l4_port_max);
-            if (dev->ntuple_filter_support) {
-                if (netdev_filter_ip_add(dev->dev_id, cfg->local_ips[lip_idx],
-                                         rxq_id) < 0) {
-                    rte_exit(EXIT_FAILURE, "Cannot add ip filter.\n");
-                }
-                if (rte_eth_dev_set_link_up(dev->dev_id) < 0) {
-                    rte_exit(EXIT_FAILURE, "Cannot set dev link up.\n");
-                }
-            }
-            lip_idx++;
-        }
-        dev->local_ipaddrs_percore[lcore_id] = addrs;
-        dev->local_ipaddr_count_percore[lcore_id] = lip_min_count_percore;
-    }
-
-    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        struct lb_local_ipv4_addr *addr;
-
-        if (lip_idx == cfg->local_ip_count)
-            break;
-        addr = dev->local_ipaddrs_percore[lcore_id] +
-               dev->local_ipaddr_count_percore[lcore_id];
-        rxq_id = dev->lcore_to_rxq[lcore_id];
-        __local_ipv4_addr_init(addr, cfg->local_ips[lip_idx], rxq_id,
-                               cfg->l4_port_min, cfg->l4_port_max);
-        dev->local_ipaddr_count_percore[lcore_id]++;
-        if (dev->ntuple_filter_support) {
-            if (netdev_filter_ip_add(dev->dev_id, cfg->local_ips[lip_idx],
-                                     rxq_id) < 0) {
-                rte_exit(EXIT_FAILURE, "Cannot add ip filter.\n");
-            }
-            if (rte_eth_dev_set_link_up(dev->dev_id) < 0) {
-                rte_exit(EXIT_FAILURE, "Cannot set dev link up.\n");
-            }
-        }
-        lip_idx++;
-    }
+    rte_eth_macaddr_get(dev->phy_portid, &dev->ha);
 }
 
 static void
@@ -298,53 +100,108 @@ __netdev_map_queue_to_lcore(struct lb_net_device *dev) {
 }
 
 static void
-__netdev_enable_tx_offload(struct lb_net_device *dev) {
-    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_IPV4_CKSUM) {
-        dev->tx_ol_flags |= LB_TX_OL_IPV4_CKSUM;
-        RTE_LOG(INFO, LB, "Hardware Ip checksum enable.\n");
-    }
+__eth_dev_config(uint16_t port_id, uint16_t nb_rxq, uint16_t nb_txq,
+                 uint16_t rxq_size, uint16_t txq_size,
+                 const struct rte_eth_conf *dev_conf,
+                 const struct rte_eth_rxconf *rx_conf,
+                 const struct rte_eth_txconf *tx_conf, struct rte_mempool *mp) {
+    uint16_t i;
 
-    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_UDP_CKSUM) {
-        dev->tx_ol_flags |= LB_TX_OL_UDP_CKSUM;
-        RTE_LOG(INFO, LB, "Hardware Udp checksum enable.\n");
+    if (rte_eth_dev_configure(port_id, nb_rxq, nb_txq, dev_conf) < 0) {
+        rte_exit(EXIT_FAILURE, "Configure device%u failed.\n", port_id);
     }
-
-    if (dev->tx_offload_capa & DEV_TX_OFFLOAD_TCP_CKSUM) {
-        dev->tx_ol_flags |= LB_TX_OL_TCP_CKSUM;
-        RTE_LOG(INFO, LB, "Hardware Tcp checksum enable.\n");
+    for (i = 0; i < nb_rxq; i++) {
+        if (rte_eth_rx_queue_setup(port_id, i, rxq_size,
+                                   rte_eth_dev_socket_id(port_id), rx_conf,
+                                   mp) < 0) {
+            rte_exit(EXIT_FAILURE, "Configure device%u rx queue failed.\n",
+                     port_id);
+        }
     }
-}
-
-static void
-__netdev_init_hw_info(struct lb_net_device *dev) {
-    const struct netdev_config *cfg = &lb_cfg->netdev;
-    struct rte_eth_dev_info dev_info;
-    uint16_t port_id = dev->dev_id;
-
-    /* Net dev default info */
-    rte_eth_dev_info_get(port_id, &dev_info);
-    dev->rx_offload_capa = dev_info.rx_offload_capa;
-    dev->tx_offload_capa = dev_info.tx_offload_capa;
-    dev->max_rx_queues = dev_info.max_rx_queues;
-    dev->max_tx_queues = dev_info.max_tx_queues;
-    dev->max_rx_desc = dev_info.rx_desc_lim.nb_max;
-    dev->max_tx_desc = dev_info.tx_desc_lim.nb_max;
-    dev->nb_rx_desc = RTE_MIN(cfg->rxq_desc_num, dev->max_rx_desc);
-    dev->nb_tx_desc = RTE_MIN(cfg->txq_desc_num, dev->max_tx_desc);
-    if (rte_eth_dev_filter_supported(port_id, RTE_ETH_FILTER_NTUPLE) == 0) {
-        dev->ntuple_filter_support = 1;
-    } else {
-        dev->ntuple_filter_support = 0;
+    for (i = 0; i < nb_txq; i++) {
+        if (rte_eth_tx_queue_setup(port_id, i, txq_size,
+                                   rte_eth_dev_socket_id(port_id),
+                                   tx_conf) < 0) {
+            rte_exit(EXIT_FAILURE, "Configure device%u rx queue failed.\n",
+                     port_id);
+        }
     }
-    rte_eth_dev_get_mtu(port_id, &dev->mtu);
-    if (cfg->enable_tx_offload) {
-        __netdev_enable_tx_offload(dev);
+    if (rte_eth_dev_start(port_id) < 0) {
+        rte_exit(EXIT_FAILURE, "device%u start failed.\n", port_id);
     }
 }
 
 static void
-__netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
-    static const struct rte_eth_conf device_conf = {
+__netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mp) {
+    static const struct rte_eth_conf dev_conf = {
+        .rxmode =
+            {
+                .mq_mode = ETH_MQ_RX_RSS,
+                .max_rx_pkt_len = ETHER_MAX_LEN,
+            },
+    };
+    struct netdev_config *cfg = &(lb_cfg->netdev);
+    char mac[ETHER_ADDR_FMT_SIZE];
+    char *devargs;
+    int len;
+
+    ether_format_addr(mac, ETHER_ADDR_FMT_SIZE, &dev->ha);
+    len =
+        snprintf(NULL, 0, "virtio_user%d,path=/dev/vhost-net,mac=%s,iface=%s%d",
+                 dev->phy_portid, mac, cfg->name_prefix, dev->phy_portid);
+    len += 1;
+    devargs = malloc(len);
+    if (!devargs) {
+        rte_exit(EXIT_FAILURE, "Alloc memory for devargs failed.\n");
+    }
+    snprintf(devargs, len,
+             "virtio_user%d,path=/dev/vhost-net,mac=%s,iface=%s%d",
+             dev->phy_portid, mac, cfg->name_prefix, dev->phy_portid);
+    if (rte_eth_dev_attach(devargs, &dev->kni_portid) < 0) {
+        rte_exit(EXIT_FAILURE, "Create vdev failed.\n");
+    }
+
+    __eth_dev_config(dev->kni_portid, 1, 1, 256, 256, &dev_conf, NULL, NULL,
+                     mp);
+
+    /* config kni ip */
+    dev->ip = cfg->kni_ip;
+    dev->netmask = cfg->kni_netmask;
+    dev->gw = cfg->kni_gateway;
+
+    free(devargs);
+}
+
+static void
+tx_buffer_callback(struct rte_mbuf **pkts, uint16_t unsend, void *userdata) {
+    uint16_t i;
+    struct lb_net_device *dev = userdata;
+
+    for (i = 0; i < unsend; i++) {
+        rte_pktmbuf_free(pkts[i]);
+    }
+    dev->tx_dropped[rte_lcore_id()] += unsend;
+}
+
+static void
+__init_tx_buffer(struct lb_net_device *dev) {
+    uint32_t lcore_id;
+
+    RTE_LCORE_FOREACH(lcore_id) {
+        dev->tx_buffer[lcore_id] =
+            rte_zmalloc("tx-buffer", RTE_ETH_TX_BUFFER_SIZE(PKT_MAX_BURST), 0);
+        if (!dev->tx_buffer[lcore_id]) {
+            rte_exit(EXIT_FAILURE, "Create tx-buffer failed.\n");
+        }
+        rte_eth_tx_buffer_init(dev->tx_buffer[lcore_id], PKT_MAX_BURST);
+        rte_eth_tx_buffer_set_err_callback(dev->tx_buffer[lcore_id],
+                                           tx_buffer_callback, dev);
+    }
+}
+
+static void
+__netdev_init_phy(struct lb_net_device *dev, struct rte_mempool *mp) {
+    static const struct rte_eth_conf dev_conf = {
         .rxmode =
             {
                 .mq_mode = ETH_MQ_RX_RSS,
@@ -364,27 +221,17 @@ __netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
             {
                 .rss_conf =
                     {
-                        .rss_key = NULL, .rss_hf = ETH_RSS_PROTO_MASK,
+                        .rss_key = NULL,
+                        .rss_hf = ETH_RSS_PROTO_MASK,
                     },
             },
         .lpbk_mode = 0,
     };
     struct rte_eth_link eth_link;
-    uint16_t id;
     struct rte_eth_dev_info dev_info;
     struct rte_eth_txconf tx_conf;
 
-    if (rte_eth_dev_configure(dev->dev_id, dev->nb_rx_queues, dev->nb_tx_queues,
-                              &device_conf) < 0) {
-        rte_exit(EXIT_FAILURE, "Configure net device failed.\n");
-    }
-    for (id = 0; id < dev->nb_rx_queues; id++) {
-        if (rte_eth_rx_queue_setup(dev->dev_id, id, dev->nb_rx_desc,
-                                   rte_eth_dev_socket_id(dev->dev_id), NULL,
-                                   mempool) < 0) {
-            rte_exit(EXIT_FAILURE, "Configure net device rx queue failed.\n");
-        }
-    }
+    __init_tx_buffer(dev);
 
     rte_eth_dev_info_get(0, &dev_info);
     tx_conf = dev_info.default_txconf;
@@ -393,24 +240,137 @@ __netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
         dev->tx_ol_flags & LB_TX_OL_UDP_CKSUM) {
         tx_conf.txq_flags = ETH_TXQ_FLAGS_NOMULTSEGS;
     }
-    for (id = 0; id < dev->nb_tx_queues; id++) {
-        if (rte_eth_tx_queue_setup(dev->dev_id, id, dev->nb_tx_desc,
-                                   rte_eth_dev_socket_id(dev->dev_id),
-                                   &tx_conf) < 0) {
-            rte_exit(EXIT_FAILURE, "Configure net device rx queue failed.\n");
+
+    __eth_dev_config(dev->phy_portid, dev->nb_rx_queues, dev->nb_tx_queues,
+                     dev->nb_rx_desc, dev->nb_tx_desc, &dev_conf, NULL,
+                     &tx_conf, mp);
+
+    rte_eth_link_get_nowait(dev->phy_portid, &eth_link);
+    dev->link_status = eth_link.link_status;
+    RTE_LOG(INFO, LB, "port%" PRIu32 " (%" PRIu32 " Gbps) %s\n",
+            dev->phy_portid, eth_link.link_speed / 1000,
+            eth_link.link_status ? "LINK_UP" : "LINK_DOWN");
+}
+
+static void
+__ip_filter_add(uint16_t ifid, uint32_t dst_ip, uint16_t rxq_id) {
+    struct rte_eth_ntuple_filter filter = {
+        .flags = RTE_5TUPLE_FLAGS,
+        .dst_ip = dst_ip,
+        .dst_ip_mask = UINT32_MAX, /* Enable */
+        .src_ip = 0,
+        .src_ip_mask = 0, /* Disable */
+        .dst_port = 0,
+        .dst_port_mask = 0, /* Disable */
+        .src_port = 0,
+        .src_port_mask = 0, /* Disable */
+        .proto = 0,
+        .proto_mask = 0, /* Disable */
+        .tcp_flags = 0,
+        .priority = 1, /* Lowest */
+        .queue = rxq_id,
+    };
+
+    if (rte_eth_dev_filter_ctrl(ifid, RTE_ETH_FILTER_NTUPLE, RTE_ETH_FILTER_ADD,
+                                &filter) < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot set device ip filter.\n");
+    }
+    if (rte_eth_dev_set_link_up(ifid) < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot set device link up.\n");
+    }
+}
+
+static struct rte_ring *
+__init_local_ports(const char *name, uint16_t min_port, uint16_t max_port) {
+    struct rte_ring *ports;
+    uint16_t port;
+    int ret;
+
+    ports = rte_ring_create(name, 65536, rte_socket_id(),
+                            RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (!ports) {
+        rte_exit(EXIT_FAILURE, "Cannot create ring %s for local ports: %s\n",
+                 name, rte_strerror(rte_errno));
+    }
+    for (port = min_port; port != max_port; port++) {
+        ret = rte_ring_sp_enqueue(ports,
+                                  (void *)(uintptr_t)rte_cpu_to_be_16(port));
+        if (ret != 0) {
+            rte_exit(EXIT_FAILURE, "Cannot put port to ring %s: %s\n", name,
+                     rte_strerror(rte_errno));
         }
     }
-    if (rte_eth_dev_start(dev->dev_id) < 0) {
-        rte_exit(EXIT_FAILURE, "Net device start failed.\n");
+    return ports;
+}
+
+static void
+__init_local_ipv4_addr(struct lb_local_ipv4_addr *addr, uint32_t ip,
+                       uint16_t rxq_id, uint16_t min_port, uint16_t max_port) {
+    char name[RTE_RING_NAMESIZE];
+
+    addr->ip = ip;
+    addr->rxq_id = rxq_id;
+    snprintf(name, RTE_RING_NAMESIZE, "tcp-ports%p", addr);
+    addr->ports[LB_PROTO_TCP] = __init_local_ports(name, min_port, max_port);
+    snprintf(name, RTE_RING_NAMESIZE, "udp-ports%p", addr);
+    addr->ports[LB_PROTO_UDP] = __init_local_ports(name, min_port, max_port);
+}
+
+static void
+__netdev_init_local_ipaddr(struct lb_net_device *dev) {
+    struct netdev_config *cfg = &(lb_cfg->netdev);
+    uint32_t lip_min_count_percore;
+    uint32_t lip_idx = 0;
+    uint32_t lcore_id;
+    uint16_t rxq_id;
+
+    if (cfg->local_ip_count < rte_lcore_count() - 1) {
+        rte_exit(EXIT_FAILURE,
+                 "The number of local ipv4 address (%u) is less than "
+                 "the number of worker thread (%u).\n",
+                 cfg->local_ip_count, rte_lcore_count() - 1);
+    }
+    lip_min_count_percore = cfg->local_ip_count / (rte_lcore_count() - 1);
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        struct lb_local_ipv4_addr *addrs;
+        uint32_t i;
+
+        addrs = rte_calloc(NULL, lip_min_count_percore + 1,
+                           sizeof(struct lb_local_ipv4_addr), 0);
+        if (!addrs) {
+            rte_exit(EXIT_FAILURE,
+                     "Cannot alloc memory for local ipv4 address.\n");
+        }
+        rxq_id = dev->lcore_to_rxq[lcore_id];
+        for (i = 0; i < lip_min_count_percore; ++i) {
+            __init_local_ipv4_addr(&addrs[i], cfg->local_ips[lip_idx], rxq_id,
+                                   cfg->l4_port_min, cfg->l4_port_max);
+            if (dev->ntuple_filter_support) {
+                __ip_filter_add(dev->phy_portid, cfg->local_ips[lip_idx],
+                                rxq_id);
+            }
+            lip_idx++;
+        }
+        dev->local_ipaddrs_percore[lcore_id] = addrs;
+        dev->local_ipaddr_count_percore[lcore_id] = lip_min_count_percore;
     }
 
-    rte_eth_promiscuous_enable(dev->dev_id);
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        struct lb_local_ipv4_addr *addr;
 
-    rte_eth_link_get_nowait(dev->dev_id, &eth_link);
-    dev->link_status = eth_link.link_status;
-    RTE_LOG(INFO, LB, "port%" PRIu32 " (%" PRIu32 " Gbps) %s\n", dev->dev_id,
-            eth_link.link_speed / 1000,
-            eth_link.link_status ? "LINK_UP" : "LINK_DOWN");
+        if (lip_idx == cfg->local_ip_count)
+            break;
+        addr = dev->local_ipaddrs_percore[lcore_id] +
+               dev->local_ipaddr_count_percore[lcore_id];
+        rxq_id = dev->lcore_to_rxq[lcore_id];
+        __init_local_ipv4_addr(addr, cfg->local_ips[lip_idx], rxq_id,
+                               cfg->l4_port_min, cfg->l4_port_max);
+        dev->local_ipaddr_count_percore[lcore_id]++;
+        if (dev->ntuple_filter_support) {
+            __ip_filter_add(dev->phy_portid, cfg->local_ips[lip_idx], rxq_id);
+        }
+        lip_idx++;
+    }
 }
 
 static void
@@ -419,11 +379,11 @@ net_device_init(void) {
     if (!lb_netdev) {
         rte_exit(EXIT_FAILURE, "Alloc memory for net device failed.\n");
     }
+    lb_netdev->phy_portid = 0;
     __netdev_init_hw_info(lb_netdev);
     __netdev_map_queue_to_lcore(lb_netdev);
-    __netdev_init_tx_buffer(lb_netdev);
     __netdev_init_kni(lb_netdev, lb_pktmbuf_pool);
-    __netdev_config_start(lb_netdev, lb_pktmbuf_pool);
+    __netdev_init_phy(lb_netdev, lb_pktmbuf_pool);
     __netdev_init_local_ipaddr(lb_netdev);
 }
 
@@ -431,7 +391,7 @@ static void
 netdev_reset_stats_cmd_cb(__attribute__((unused)) int fd,
                           __attribute__((unused)) char *argv[],
                           __attribute__((unused)) int argc) {
-    rte_eth_stats_reset(lb_netdev->dev_id);
+    rte_eth_stats_reset(lb_netdev->phy_portid);
 }
 
 /*
@@ -516,7 +476,7 @@ netdev_show_stats_cmd_cb(int fd, char *argv[], int argc) {
         output_fmt = ndev_stats_norm_fmt;
     }
 
-    rte_eth_stats_get(lb_netdev->dev_id, &stats);
+    rte_eth_stats_get(lb_netdev->phy_portid, &stats);
     RTE_LCORE_FOREACH(lcore_id) {
         tx_dropped += lb_netdev->tx_dropped[lcore_id];
         rx_dropped += lb_netdev->rx_dropped[lcore_id];
@@ -541,9 +501,10 @@ netdev_show_ipaddr_cmd_cb(int fd, __attribute__((unused)) char *argv[],
         ipv4_addr_tostring(lb_netdev->ip, buf[0], sizeof(buf[0]));
         ipv4_addr_tostring(lb_netdev->netmask, buf[1], sizeof(buf[1]));
         ipv4_addr_tostring(lb_netdev->gw, buf[2], sizeof(buf[2]));
-        unixctl_command_reply(fd, "KNI-IPADDR:\n"
-                                  "  IP               Netmask          GW\n"
-                                  "  %-15s  %-15s  %-15s\n",
+        unixctl_command_reply(fd,
+                              "KNI-IPADDR:\n"
+                              "  IP               Netmask          GW\n"
+                              "  %-15s  %-15s  %-15s\n",
                               buf[0], buf[1], buf[2]);
     }
     {
@@ -573,9 +534,10 @@ netdev_show_hwinfo_cmd_cb(int fd, __attribute__((unused)) char *argv[],
     mac_addr_tostring(&lb_netdev->ha, mac, sizeof(mac));
     memset(&link_params, 0, sizeof(link_params));
     rte_eth_link_get(0, &link_params);
-    unixctl_command_reply(fd, "HWaddress: %s\n"
-                              "Rxq_Num: %u\n"
-                              "Link-Status: %s\n",
+    unixctl_command_reply(fd,
+                          "HWaddress: %s\n"
+                          "Rxq_Num: %u\n"
+                          "Link-Status: %s\n",
                           mac, lb_netdev->nb_rx_queues,
                           link_params.link_status == ETH_LINK_DOWN ? "DOWN"
                                                                    : "UP");
@@ -586,8 +548,7 @@ pktmbuf_pool_init(void) {
     struct netdev_config *cfg = &(lb_cfg->netdev);
     uint32_t num;
 
-    num = (cfg->rxq_desc_num + cfg->txq_desc_num) * rte_lcore_count() *
-              rte_eth_dev_count() +
+    num = (cfg->rxq_desc_num + cfg->txq_desc_num) * rte_lcore_count() +
           cfg->mbuf_num;
     lb_pktmbuf_pool =
         rte_pktmbuf_pool_create("pktmbuf-pool", num, 256, 0,
@@ -602,6 +563,7 @@ lb_net_device_init(void) {
     if (rte_eth_dev_count() != 1) {
         rte_exit(EXIT_FAILURE, "The number of Net device is not equal to 1.\n");
     }
+
     pktmbuf_pool_init();
     net_device_init();
 
