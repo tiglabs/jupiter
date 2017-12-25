@@ -14,9 +14,15 @@ Jupiter is a high-performance 4-layer network load balance service based on DPDK
 
 ## How to use
 
-### 1. Compilation
+### 1. Required
 
-Required  OS release: Centos-7.2 or Centos-7.4
+linux kernel version: >= 2.6.34
+
+glibc version: >= 2.7
+
+RPM packages dependence: numactl-devel, libpcap-devel
+
+### 2. Compilation
 
 ```bash
 tar -xf jupiter.tar.gz
@@ -25,7 +31,7 @@ make rpm-pkg
 rpm -i rpmbuild/RPMS/x86_64/jupiter-0.1-1.x86_64.rpm
 ```
 
-### 2. Startup
+### 3. Startup
 
 The default configuration path for jupiter-service is /etc/jupiter/jupiter.cfg. An example for jupiter.cfg as follows :
 
@@ -53,18 +59,17 @@ mount -t hugetlbfs nodev /mnt/huge
 echo 4096 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
-Load [igb_uio](http://dpdk.org/doc/guides/linux_gsg/linux_drivers.html) module:
+Load [UIO](http://dpdk.org/doc/guides/linux_gsg/linux_drivers.html) module:
 
 ```bash
-modprobe uio
-insmod /usr/share/jupiter/kmod/igb_uio.ko
-/usr/share/jupiter/tools/dpdk-devbind.py --bind=igb_uio eth1
+modprobe uio_pci_generic
+/usr/share/jupiter/tools/dpdk-devbind.py --bind=uio_pci_generic eth1
 ```
 
-Load [rte_kni](http://dpdk.org/doc/guides/linux_gsg/enable_func.html#loading-the-dpdk-kni-kernel-module) module:
+Load vhost-net module:
 
 ```bash
-insmod /usr/share/jupiter/kmod/rte_kni.ko
+modprobe vhost-net
 ```
 
 Start up jupier-service:
