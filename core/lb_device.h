@@ -28,14 +28,15 @@ struct lb_local_ipv4_addr {
 
 struct lb_net_device {
     struct ether_addr ha;
-
-	uint16_t phy_portid;
-	uint16_t kni_portid;
+    uint16_t dev_id;
 
     /* Kni device IP info */
     uint32_t ip;
     uint32_t netmask;
     uint32_t gw;
+
+    struct rte_kni *kni;
+    char *kni_name[RTE_KNI_NAMESIZE];
 
     struct lb_local_ipv4_addr *local_ipaddrs_percore[RTE_MAX_LCORE];
     uint32_t local_ipaddr_count_percore[RTE_MAX_LCORE];

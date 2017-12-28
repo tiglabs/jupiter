@@ -380,8 +380,7 @@ vhost_kernel_enable_queue_pair(struct virtio_user_dev *dev,
 	else
 		hdr_size = sizeof(struct virtio_net_hdr);
 
-	tapfd = vhost_kernel_open_tap(&dev->ifname, hdr_size, req_mq,
-			 (char *)dev->mac_addr);
+	tapfd = vhost_kernel_open_tap(&dev->ifname, hdr_size, req_mq);
 	if (tapfd < 0) {
 		PMD_DRV_LOG(ERR, "fail to open tap for vhost kernel");
 		return -1;

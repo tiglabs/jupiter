@@ -64,5 +64,4 @@
 /* Constants */
 #define PATH_NET_TUN	"/dev/net/tun"
 
-int vhost_kernel_open_tap(char **p_ifname, int hdr_size, int req_mq,
-			 const char *mac);
+int vhost_kernel_open_tap(char **p_ifname, int hdr_size, int req_mq);

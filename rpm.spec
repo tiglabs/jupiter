@@ -8,7 +8,7 @@ License: MIT
 URL: none
 Source: jupiter-%{_version}.tar.xz
 
-BuildRequires: numactl-devel, libpcap-devel
+BuildRequires: kernel-devel, kernel-headers, libpcap-devel
 
 # Requires:
 
@@ -24,7 +24,7 @@ make machine=%{_machine}
 
 %install
 rm -rf %{buildroot}
-make install DESTDIR=%{buildroot} bindir=%{_bindir} tooldir=%{_datadir}/jupiter/tools confdir=/etc/jupiter machine=%{_machine}
+make install DESTDIR=%{buildroot} bindir=%{_bindir} tooldir=%{_datadir}/jupiter/tools kmoddir=%{_datadir}/jupiter/kmod confdir=/etc/jupiter machine=%{_machine}
 
 %files
 %{_bindir}/*
