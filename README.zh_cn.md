@@ -14,15 +14,9 @@ Jupiter是一个基于DPDK实现的高性能4层网络负载均衡服务，支�
 
 ## 下载使用
 
-### 1. 系统要求
+### 1. 下载源码，编译安装RPM包
 
-linux内核版本： >= 2.6.34
-
-glibc版本: >= 2.7
-
-RPM依赖包: numactl-devel, libpcap-devel
-
-### 2. 下载源码，编译安装RPM包
+支持的OS发行版本: Centos-7.2或者Centos-7.4
 
 ```bash
 tar -xf jupiter.tar.gz
@@ -31,7 +25,7 @@ make rpm-pkg
 rpm -i rpmbuild/RPMS/x86_64/jupiter-0.1-1.x86_64.rpm
 ```
 
-### 3. 配置参数，启动服务
+### 2. 配置参数，启动服务
 
 jupiter-service的默认配置文件路径是/etc/jupiter/jupiter.cfg，配置文件的一个例子如下：
 
@@ -57,17 +51,18 @@ kni-gateway = 1.1.1.254
 echo 4096 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
-加载[UIO](http://dpdk.org/doc/guides/linux_gsg/linux_drivers.html)模块，为网卡绑定用户态驱动uio_pci_generic：
+加载[IGB_UIO](http://dpdk.org/doc/guides/linux_gsg/linux_drivers.html)模块，为网卡绑定用户态驱动igb_uio：
 
 ```bash
-modprobe uio_pci_generic
-/usr/share/jupiter/tools/dpdk-devbind.py --bind=uio_pci_generic eth1
+modprobe uio
+insmod /usr/share/jupiter/kmod/igb_uio.ko
+/usr/share/jupiter/tools/dpdk-devbind.py --bind=igb_uio eth1
 ```
 
-加载vhost-net模块:
+加载[KNI](http://dpdk.org/doc/guides/linux_gsg/enable_func.html#loading-the-dpdk-kni-kernel-module)模块:
 
 ```bash
-modprobe vhost-net
+insmod /usr/share/jupiter/kmod/rte_kni.ko
 ```
 
 启动jupier-service进程:
