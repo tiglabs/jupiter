@@ -36,13 +36,11 @@ struct lb_net_device {
     uint32_t gw;
 
     struct rte_kni *kni;
-    char *kni_name[RTE_KNI_NAMESIZE];
 
     struct lb_local_ipv4_addr *local_ipaddrs_percore[RTE_MAX_LCORE];
     uint32_t local_ipaddr_count_percore[RTE_MAX_LCORE];
 
     /* Physical net device default config */
-    uint16_t mtu; /* MTU */
     uint16_t ntuple_filter_support;
     uint32_t rx_offload_capa; /* Device RX offload capabilities. */
     uint32_t tx_offload_capa; /* Device TX offload capabilities. */

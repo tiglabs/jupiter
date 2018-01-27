@@ -1,11 +1,17 @@
 /* Copyright (c) 2017. TIG developer. */
 
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+
 #include <stdint.h>
 
 #include <rte_bus_pci.h>
 #include <rte_cycles.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
+#include <rte_ether.h>
 #include <rte_kni.h>
 #include <rte_malloc.h>
 #include <rte_mempool.h>
@@ -58,6 +64,26 @@ kni_config_network_interface(__attribute__((unused)) uint16_t port_id,
     return 0;
 }
 
+static int
+__kni_macaddr_set(const char *name, struct ether_addr *ha) {
+    int fd;
+    struct ifreq req;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&req, 0, sizeof(struct ifreq));
+    strncpy(req.ifr_name, name, IFNAMSIZ);
+	req.ifr_addr.sa_family = ARPHRD_ETHER;
+	memcpy(req.ifr_hwaddr.sa_data, ha->addr_bytes, ETHER_ADDR_LEN);
+    if (ioctl(fd, SIOCSIFHWADDR, &req) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static void
 __netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mempool) {
     struct netdev_config *cfg = &(lb_cfg->netdev);
@@ -86,6 +112,10 @@ __netdev_init_kni(struct lb_net_device *dev, struct rte_mempool *mempool) {
     dev->kni = rte_kni_alloc(mempool, &conf, &ops);
     if (!dev->kni) {
         rte_exit(EXIT_FAILURE, "Create KNI device failed.\n");
+    }
+
+    if (__kni_macaddr_set(conf.name, &dev->ha) < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot set KNI mac address.\n");
     }
 
     /* config kni ip */
@@ -305,11 +335,10 @@ __netdev_init_hw_info(struct lb_net_device *dev) {
     } else {
         dev->ntuple_filter_support = 0;
     }
-    rte_eth_macaddr_get(port_id, &dev->ha);
-    rte_eth_dev_get_mtu(port_id, &dev->mtu);
     if (cfg->enable_tx_offload) {
         __netdev_enable_tx_offload(dev);
     }
+    rte_eth_macaddr_get(port_id, &dev->ha);
 }
 
 static void
@@ -334,7 +363,8 @@ __netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
             {
                 .rss_conf =
                     {
-                        .rss_key = NULL, .rss_hf = ETH_RSS_PROTO_MASK,
+                        .rss_key = NULL,
+                        .rss_hf = ETH_RSS_PROTO_MASK,
                     },
             },
         .lpbk_mode = 0,
@@ -373,6 +403,7 @@ __netdev_config_start(struct lb_net_device *dev, struct rte_mempool *mempool) {
     if (rte_eth_dev_start(dev->dev_id) < 0) {
         rte_exit(EXIT_FAILURE, "Net device start failed.\n");
     }
+
     rte_eth_link_get_nowait(dev->dev_id, &eth_link);
     dev->link_status = eth_link.link_status;
     RTE_LOG(INFO, LB, "port%" PRIu32 " (%" PRIu32 " Gbps) %s\n", dev->dev_id,
@@ -508,9 +539,10 @@ netdev_show_ipaddr_cmd_cb(int fd, __attribute__((unused)) char *argv[],
         ipv4_addr_tostring(lb_netdev->ip, buf[0], sizeof(buf[0]));
         ipv4_addr_tostring(lb_netdev->netmask, buf[1], sizeof(buf[1]));
         ipv4_addr_tostring(lb_netdev->gw, buf[2], sizeof(buf[2]));
-        unixctl_command_reply(fd, "KNI-IPADDR:\n"
-                                  "  IP               Netmask          GW\n"
-                                  "  %-15s  %-15s  %-15s\n",
+        unixctl_command_reply(fd,
+                              "KNI-IPADDR:\n"
+                              "  IP               Netmask          GW\n"
+                              "  %-15s  %-15s  %-15s\n",
                               buf[0], buf[1], buf[2]);
     }
     {
@@ -540,9 +572,10 @@ netdev_show_hwinfo_cmd_cb(int fd, __attribute__((unused)) char *argv[],
     mac_addr_tostring(&lb_netdev->ha, mac, sizeof(mac));
     memset(&link_params, 0, sizeof(link_params));
     rte_eth_link_get(0, &link_params);
-    unixctl_command_reply(fd, "HWaddress: %s\n"
-                              "Rxq_Num: %u\n"
-                              "Link-Status: %s\n",
+    unixctl_command_reply(fd,
+                          "HWaddress: %s\n"
+                          "Rxq_Num: %u\n"
+                          "Link-Status: %s\n",
                           mac, lb_netdev->nb_rx_queues,
                           link_params.link_status == ETH_LINK_DOWN ? "DOWN"
                                                                    : "UP");
