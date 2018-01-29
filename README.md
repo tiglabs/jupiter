@@ -95,7 +95,7 @@ route add -net 10.0.2.0 netmask 255.255.255.0 gw 1.1.1.2
 
 ### 4. jupiter-service configuration
 
-Add a TCP virtual service 10.0.1.1:8888 and two nginx service 1.1.1.3:80, 1.1.1.4:80.
+Add a TCP virtual service 10.0.1.1:8888 and two nginx service 1.1.1.3:80, 1.1.1.4:80. [More information about command details.](doc/command.md)
 
 ```bash
 ifconfig jupiter0 1.1.1.2/24 up
