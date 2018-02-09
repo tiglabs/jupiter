@@ -41,12 +41,12 @@ lb_icmp_fullnat_handle(struct rte_mbuf *mbuf, struct ipv4_hdr *iph) {
 
     if (rte_ipv4_frag_pkt_is_fragmented(iph)) {
         ICMP_STATS_INC(rx_drop);
-        return -1;
+        goto drop;
     }
 
     if (!lb_is_vip_exist(iph->dst_addr)) {
         ICMP_STATS_INC(rx_drop);
-        return -1;
+        goto drop;
     }
 
     /*
@@ -56,7 +56,7 @@ lb_icmp_fullnat_handle(struct rte_mbuf *mbuf, struct ipv4_hdr *iph) {
     if (!((icmph->icmp_type == IP_ICMP_ECHO_REQUEST) &&
           (icmph->icmp_code == 0))) {
         ICMP_STATS_INC(rx_drop);
-        return -1;
+        goto drop;
     }
 
     ip_addr = iph->src_addr;
@@ -74,11 +74,16 @@ lb_icmp_fullnat_handle(struct rte_mbuf *mbuf, struct ipv4_hdr *iph) {
     if (lb_ether_build_header(mbuf, rte_pktmbuf_mtod(mbuf, struct ether_hdr *),
                               iph->dst_addr) < 0) {
         ICMP_STATS_INC(tx_drop);
+        /* mbuf will be released on the master lcore. */
         return -1;
     }
     lb_netdev_xmit(mbuf);
     ICMP_STATS_INC(tx);
     return 0;
+
+drop:
+    rte_pktmbuf_free(mbuf);
+    return -1;
 }
 
 static void
