@@ -211,7 +211,7 @@ static int
 __parse_ip_address_list(const char *addr_list, uint32_t addrs[],
                         uint16_t addr_max_count) {
     char *str;
-    char *p, *q;
+    char *p;
     uint32_t addr;
     uint16_t count = 0;
 
@@ -221,8 +221,7 @@ __parse_ip_address_list(const char *addr_list, uint32_t addrs[],
     }
     p = strtok(str, " ,");
     while (p != NULL) {
-        q = strchr(p, '-');
-        if (!q) {
+        if (strchr(p, '-') == NULL) {
             if (parse_ipv4_addr(p, (struct in_addr *)&addr) < 0) {
                 return -1;
             }
@@ -231,28 +230,17 @@ __parse_ip_address_list(const char *addr_list, uint32_t addrs[],
             }
             addrs[count++] = addr;
         } else {
-            uint8_t addr_a[5];
-            uint16_t i;
-            uint64_t val;
+            uint32_t addr_a[5];
 
-            for (i = 0; i < sizeof(addr_a); i++) {
-                val = strtoul(p, &q, 0);
-                if (p == q) {
-                    return -1;
-                }
-                if (val >= 255) {
-                    return -1;
-                }
-                addr_a[i] = val;
-                if (q == '\0') {
-                    break;
-                }
-                q++;
-                p = q;
-            }
-            if (i != sizeof(addr_a)) {
-                return -1;
-            }
+			sscanf(p, "%u.%u.%u.%u-%u", &addr_a[0], &addr_a[1],
+				&addr_a[2], &addr_a[3], &addr_a[4]);
+			if (addr_a[0] > UINT8_MAX ||
+				addr_a[1] > UINT8_MAX ||
+				addr_a[2] > UINT8_MAX ||
+				addr_a[3] > UINT8_MAX ||
+				addr_a[4] > UINT8_MAX) {
+				return -1;
+			}
             for (; addr_a[3] <= addr_a[4]; addr_a[3]++) {
                 addr = IPV4_ADDR(addr_a[0], addr_a[1], addr_a[2], addr_a[3]);
                 addr = rte_cpu_to_be_32(addr);

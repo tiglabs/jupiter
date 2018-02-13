@@ -14,7 +14,7 @@ RTE_SDK = $(CURDIR)/dpdk-17.11
 export RTE_SDK
 
 # Default target, can be overriden by command line or environment
-RTE_TARGET ?= x86_64-$(machine)-linuxapp-gcc
+RTE_TARGET ?= x86_64-native-linuxapp-gcc
 export RTE_TARGET
 
 ifeq ($(bindir),)
