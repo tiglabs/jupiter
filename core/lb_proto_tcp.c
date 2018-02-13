@@ -347,7 +347,7 @@ tcp_send_rst(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port,
         th->tcp_flags = TCP_RST_FLAG;
         th->tcp_flags |= TCP_ACK_FLAG;
     }
-    th->data_off = sizeof(struct tcp_hdr) << 2;
+    th->data_off = sizeof(struct tcp_hdr) >> 2;
     th->rx_win = 0;
     th->tcp_urp = 0;
 
