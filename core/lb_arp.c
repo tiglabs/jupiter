@@ -189,9 +189,10 @@ arp_notfind_event_cb(__attribute__((unused)) unsigned snd_lcoreid,
     struct rte_mbuf *pkt = param;
     struct ipv4_hdr *iph =
         rte_pktmbuf_mtod_offset(pkt, struct ipv4_hdr *, ETHER_HDR_LEN);
+    uint32_t rt_ip;
 
-    arp_send(ARP_OP_REQUEST, iph->dst_addr, iph->src_addr, NULL,
-             &lb_netdev->ha);
+    rt_ip = lb_netdev_ipv4_route(iph->dst_addr);
+    arp_send(ARP_OP_REQUEST, rt_ip, lb_netdev->ip, NULL, &lb_netdev->ha);
     rte_pktmbuf_free(pkt);
 }
 
