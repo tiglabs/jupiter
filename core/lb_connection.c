@@ -41,6 +41,8 @@
         rte_atomic32_add(&real_srv->refcnt, 1);                                \
         conn->real_service = real_srv;                                         \
         conn->local_ipaddr = local_addr;                                       \
+        conn->conntrack_state = 0;                                             \
+        conn->conntrack_flags = 0;                                             \
     } while (0)
 
 static inline int
@@ -193,6 +195,9 @@ lb_connection_update_real_service(struct lb_connection_table *table,
                                         conn->rsig, (void *)conn);
         TAILQ_INSERT_TAIL(&table->conn_expire_tbl_percore[lcore_id], conn,
                           next);
+        conn->real_service = real_service;
+		conn->conntrack_flags = 0;
+		conn->conntrack_state = 0;
     }
     LB_VS_CONN_INC(conn->real_service->virt_service);
     LB_RS_CONN_INC(conn->real_service);

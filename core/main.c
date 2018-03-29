@@ -145,7 +145,7 @@ packet_handle(struct rte_mbuf *pkt) {
 l3_packet:
     iph = (struct ipv4_hdr *)((char *)ethh + ETHER_HDR_LEN);
     if (lb_netdev_chk_ipv4(iph->dst_addr) == IS_MYADDR ||
-        IS_IPV4_MCAST(iph->dst_addr)) {
+        IS_IPV4_MCAST(rte_be_to_cpu_32(iph->dst_addr))) {
         if (lcore_event_notify(rte_get_master_lcore(), kni_packet_event_cb,
                                pkt) < 0) {
             goto drop_packet;
