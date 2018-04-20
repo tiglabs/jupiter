@@ -316,7 +316,7 @@ synproxy_recv_client_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
     if (SYN(th) && !ACK(th) && !RST(th) && !FIN(th) &&
         (vs = lb_vs_get(iph->dst_addr, th->dst_port, iph->next_proto_id)) &&
         (vs->flags & LB_VS_F_SYNPROXY)) {
-        if (lb_vs_check_max_conn(vs))
+        if (!lb_vs_check_max_conn(vs))
             synproxy_sent_client_synack(m, iph, th, port_id);
         lb_vs_put(vs);
         return 0;

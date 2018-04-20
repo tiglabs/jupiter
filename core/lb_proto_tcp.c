@@ -370,7 +370,7 @@ tcp_conn_schedule(struct lb_conn_table *ct, struct ipv4_hdr *iph,
 	if (vs == NULL)
 		return NULL;
 
-	if (!lb_vs_check_max_conn(vs)) {
+	if (lb_vs_check_max_conn(vs)) {
 		lb_vs_put(vs);
 		return NULL;
 	}
