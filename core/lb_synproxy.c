@@ -316,7 +316,10 @@ synproxy_recv_client_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
     if (SYN(th) && !ACK(th) && !RST(th) && !FIN(th) &&
         (vs = lb_vs_get(iph->dst_addr, th->dst_port, iph->next_proto_id)) &&
         (vs->flags & LB_VS_F_SYNPROXY)) {
-        if (!lb_vs_check_max_conn(vs))
+        if (lb_vs_check_max_conn(vs))
+            /* Reject connect. */
+            rte_pktmbuf_free(m);
+        else
             synproxy_sent_client_synack(m, iph, th, port_id);
         lb_vs_put(vs);
         return 0;
@@ -422,6 +425,8 @@ synproxy_recv_client_ack(struct rte_mbuf *m, struct ipv4_hdr *iph,
             conn->proxy.isn = rte_be_to_cpu_32(th->recv_ack) - 1;
 
             synproxy_sent_backend_syn(m, iph, th, conn, &opts, port_id);
+        } else {
+            rte_pktmbuf_free(m);
         }
 
         lb_vs_put(vs);
