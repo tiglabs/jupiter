@@ -8,6 +8,7 @@
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_malloc.h>
 #include <rte_pdump.h>
 #include <rte_timer.h>
 
@@ -51,6 +52,7 @@ static struct rte_timer lb_clock_timer;
 static const char *lb_cfgfile = DEFAULT_CONF_FILEPATH;
 static const char *lb_procname;
 static int lb_daemon = 0;
+static int lb_loop = 1;
 
 static void
 lb_clock_timer_cb(__attribute__((unused)) struct rte_timer *t,
@@ -198,7 +200,7 @@ master_loop(__attribute__((unused)) void *arg) {
 
     RTE_LOG(INFO, USER1, "%s(): master thread started.\n", __func__);
 
-    while (1) {
+    while (lb_loop) {
         for (i = 0; i < nb_ctx; i++) {
             rte_kni_handle_request(ctx[i].kni);
 
@@ -270,7 +272,7 @@ worker_loop(__attribute__((unused)) void *arg) {
     RTE_LOG(INFO, USER1, "%s(): worker%u thread started.\n", __func__,
             lcore_id);
 
-    while (1) {
+    while (lb_loop) {
         for (i = 0; i < nb_ctx; i++) {
             rte_eth_tx_buffer_flush(ctx[i].port_id, ctx[i].txq_id,
                                     ctx[i].tx_buffer);
@@ -436,4 +438,120 @@ main(int argc, char **argv) {
 
     return 0;
 }
+
+static void
+exit_cmd_cb(__attribute__((unused)) int fd,
+            __attribute__((unused)) char *argv[],
+            __attribute__((unused)) int argc) {
+    lb_loop = 0;
+}
+
+UNIXCTL_CMD_REGISTER("exit", "", "", 0, 0, exit_cmd_cb);
+
+static void
+quit_cmd_cb(__attribute__((unused)) int fd,
+            __attribute__((unused)) char *argv[],
+            __attribute__((unused)) int argc) {
+    lb_loop = 0;
+}
+
+UNIXCTL_CMD_REGISTER("quit", "", "", 0, 0, quit_cmd_cb);
+
+static void
+stop_cmd_cb(__attribute__((unused)) int fd,
+            __attribute__((unused)) char *argv[],
+            __attribute__((unused)) int argc) {
+    lb_loop = 0;
+}
+
+UNIXCTL_CMD_REGISTER("stop", "", "", 0, 0, stop_cmd_cb);
+
+static void
+version_cmd_cb(__attribute__((unused)) int fd,
+               __attribute__((unused)) char *argv[],
+               __attribute__((unused)) int argc) {
+    unixctl_command_reply(fd, "%s\n", VERSION);
+}
+
+UNIXCTL_CMD_REGISTER("version", "", "", 0, 0, version_cmd_cb);
+
+static int
+memory_arg_parse(char *argv[], int argc, int *json_fmt) {
+    int i = 0;
+    int rc;
+
+    if (i < argc) {
+        rc = strcmp(argv[i++], "--json");
+        if (rc != 0)
+            return i - 1;
+        *json_fmt = 1;
+    } else {
+        *json_fmt = 0;
+    }
+
+    return i;
+}
+
+static void
+memory_cmd_cb(int fd, char *argv[], int argc) {
+    int json_fmt = 0, json_first_obj = 1;
+    int rc;
+    struct rte_malloc_socket_stats sock_stats;
+    uint32_t socket_id;
+
+    rc = memory_arg_parse(argv, argc, &json_fmt);
+    if (rc != argc) {
+        unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
+        return;
+    }
+
+    if (json_fmt)
+        unixctl_command_reply(fd, "[");
+
+    for (socket_id = 0; socket_id < RTE_MAX_NUMA_NODES; socket_id++) {
+        if (rte_malloc_get_socket_stats(socket_id, &sock_stats) < 0) {
+            unixctl_command_reply_error(fd, "Cannot get memory stats.\n");
+            return;
+        }
+
+        if (!json_fmt) {
+            unixctl_command_reply(fd, "Socket%u\n", socket_id);
+            unixctl_command_reply(fd, NORM_KV_64_FMT("  Heap_size", "\n"),
+                                  (uint64_t)sock_stats.heap_totalsz_bytes);
+            unixctl_command_reply(fd, NORM_KV_64_FMT("  Free_size", "\n"),
+                                  (uint64_t)sock_stats.heap_freesz_bytes);
+            unixctl_command_reply(fd, NORM_KV_64_FMT("  Alloc_size", "\n"),
+                                  (uint64_t)sock_stats.heap_allocsz_bytes);
+            unixctl_command_reply(
+                fd, NORM_KV_64_FMT("  Greatest_free_size", "\n"),
+                (uint64_t)sock_stats.greatest_free_size);
+            unixctl_command_reply(fd, NORM_KV_32_FMT("  Alloc_count", "\n"),
+                                  (uint32_t)sock_stats.alloc_count);
+            unixctl_command_reply(fd, NORM_KV_32_FMT("  Free_count", "\n"),
+                                  (uint32_t)sock_stats.free_count);
+        } else {
+            unixctl_command_reply(fd, json_first_obj ? "{" : ",{");
+            json_first_obj = 0;
+            unixctl_command_reply(fd, JSON_KV_32_FMT("Socket", ","), socket_id);
+            unixctl_command_reply(fd, JSON_KV_64_FMT("Heap_size", ","),
+                                  (uint64_t)sock_stats.heap_totalsz_bytes);
+            unixctl_command_reply(fd, JSON_KV_64_FMT("Free_size", ","),
+                                  (uint64_t)sock_stats.heap_freesz_bytes);
+            unixctl_command_reply(fd, JSON_KV_64_FMT("Alloc_size", ","),
+                                  (uint64_t)sock_stats.heap_allocsz_bytes);
+            unixctl_command_reply(fd, JSON_KV_64_FMT("Greatest_free_size", ","),
+                                  (uint64_t)sock_stats.greatest_free_size);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("Alloc_count", ","),
+                                  (uint32_t)sock_stats.alloc_count);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("Free_count", ""),
+                                  (uint32_t)sock_stats.free_count);
+            unixctl_command_reply(fd, "}");
+        }
+    }
+    if (json_fmt)
+        unixctl_command_reply(fd, "]\n");
+}
+
+UNIXCTL_CMD_REGISTER("memory", "[--json].", "Show memory information.", 0, 1,
+                     memory_cmd_cb);
 

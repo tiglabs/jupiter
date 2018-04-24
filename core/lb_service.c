@@ -1536,7 +1536,7 @@ rs_weight_cmd_cb(int fd, char *argv[], int argc) {
     }
 }
 
-UNIXCTL_CMD_REGISTER("rs/weight", "VIP:VPORT tcp|udp RIP:RPORT [weight].",
+UNIXCTL_CMD_REGISTER("rs/weight", "VIP:VPORT tcp|udp RIP:RPORT [WEIGHT].",
                      "Show or set the weight of real services.", 3, 4,
                      rs_weight_cmd_cb);
 

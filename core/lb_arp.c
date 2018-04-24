@@ -332,5 +332,5 @@ arp_timeout_cb(int fd, char *argv[], int argc) {
     }
 }
 
-UNIXCTL_CMD_REGISTER("arp/timeout", "[SEC]", "", 0, 1, arp_timeout_cb);
+UNIXCTL_CMD_REGISTER("arp/timeout", "[SEC].", "", 0, 1, arp_timeout_cb);
 
