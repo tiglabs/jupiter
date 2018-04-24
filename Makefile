@@ -44,6 +44,8 @@ dpdk:
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_APP_TEST=).*,\1n,'         $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_LIBRTE_PMD_PCAP=).*,\1y,'  $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_KNI_KMOD_ETHTOOL=).*,\1n,' $(RTE_TARGET)/.config
+	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MAX_NUMA_NODES=).*,\12,'   $(RTE_TARGET)/.config
+	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MAX_ETHPORTS=).*,\18,'     $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET)
 
 .PHONY: jupiter
