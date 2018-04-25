@@ -1049,3 +1049,96 @@ netdev_show_fdir_cmd_cb(int fd, __attribute__((unused)) char *argv[],
 UNIXCTL_CMD_REGISTER("netdev/fdir", "", "Show NIC FDIR.", 0, 0,
                      netdev_show_fdir_cmd_cb);
 
+static int
+laddr_stats_arg_parse(char *argv[], int argc, int *json_fmt) {
+    int i = 0;
+    int rc;
+
+    if (i < argc) {
+        rc = strcmp(argv[i++], "--json");
+        if (rc != 0)
+            return i - 1;
+        *json_fmt = 1;
+    } else {
+        *json_fmt = 0;
+    }
+
+    return i;
+}
+
+static void
+laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
+    int json_fmt = 0, json_first_obj = 1;
+    int rc;
+    uint16_t nb_ports, port_id;
+    struct lb_device *dev;
+    uint32_t lcore_id;
+    struct lb_laddr_list *laddr_list;
+    struct lb_laddr *laddr;
+    uint32_t i, j;
+
+    rc = laddr_stats_arg_parse(argv, argc, &json_fmt);
+    if (rc != argc) {
+        unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
+        return;
+    }
+
+    if (json_fmt)
+        unixctl_command_reply(fd, "[");
+
+    nb_ports = rte_eth_dev_count();
+    for (port_id = 0; port_id < nb_ports; port_id++) {
+        uint32_t total_lports[LB_IPPROTO_MAX] = {0},
+                 avail_lports[LB_IPPROTO_MAX] = {0};
+
+        dev = &lb_devices[port_id];
+        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
+            continue;
+        }
+
+        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+            laddr_list = &dev->laddr_list[lcore_id];
+            for (i = 0; i < laddr_list->nb; i++) {
+                laddr = &laddr_list->entries[i];
+                for (j = 0; j < LB_IPPROTO_MAX; j++) {
+                    if (laddr->ports[j] != NULL) {
+                        avail_lports[j] += rte_ring_count(laddr->ports[j]);
+                        total_lports[j] += LB_MAX_L4_PORT - LB_MIN_L4_PORT;
+                    }
+                }
+            }
+        }
+
+        if (!json_fmt) {
+            unixctl_command_reply(fd, "dev: %s\n", dev->name);
+            unixctl_command_reply(fd, "  type: TCP\n");
+            unixctl_command_reply(fd, "    avail_lports: %u\n",
+                                  avail_lports[LB_IPPROTO_TCP]);
+            unixctl_command_reply(fd, "    total_lports: %u\n",
+                                  total_lports[LB_IPPROTO_TCP]);
+            unixctl_command_reply(fd, "  type: UDP\n");
+            unixctl_command_reply(fd, "    avail_lports: %u\n",
+                                  avail_lports[LB_IPPROTO_UDP]);
+            unixctl_command_reply(fd, "    total_lports: %u\n",
+                                  total_lports[LB_IPPROTO_UDP]);
+        } else {
+            unixctl_command_reply(fd, json_first_obj ? "{" : ",{");
+            json_first_obj = 0;
+            unixctl_command_reply(fd, JSON_KV_S_FMT("dev", ","), dev->name);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("tcp_avail_lports", ","),
+                                  avail_lports[LB_IPPROTO_TCP]);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("tcp_total_lports", ","),
+                                  total_lports[LB_IPPROTO_TCP]);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("udp_avail_lports", ","),
+                                  avail_lports[LB_IPPROTO_UDP]);
+            unixctl_command_reply(fd, JSON_KV_32_FMT("udp_total_lports", "}"),
+                                  avail_lports[LB_IPPROTO_UDP]);
+        }
+    }
+
+    if (json_fmt)
+        unixctl_command_reply(fd, "]\n");
+}
+
+UNIXCTL_CMD_REGISTER("laddr/stats", "[--json].", "Show local ip addr.", 0, 1,
+                     laddr_stats_cmd_cb);
