@@ -973,7 +973,7 @@ vs_stats_cmd_cb(int fd, char *argv[], int argc) {
     uint32_t socket_id, lcore_id;
     uint64_t rx_packets[2] = {0}, rx_bytes[2] = {0}, rx_drops[2] = {0};
     uint64_t tx_packets[2] = {0}, tx_bytes[2] = {0};
-    uint64_t active_conns = 0, history_conns = 0;
+    uint64_t active_conns = 0, history_conns = 0, max_conns = 0;
 
     rc = vs_stats_arg_parse(argv, argc, &vip, &vport, &proto, &json_fmt);
     if (rc != argc) {
@@ -1006,59 +1006,65 @@ vs_stats_cmd_cb(int fd, char *argv[], int argc) {
                 tx_bytes[1] += rs->stats[lcore_id].bytes[1];
             }
         }
+
+        max_conns = vs->max_conns;
     }
 
     if (json_fmt)
         unixctl_command_reply(fd, "{");
 
+    /* Just make it easy for agent to collect data. */
+    if (json_fmt)
+        unixctl_command_reply(fd, JSON_KV_64_FMT("max-conns", ","), max_conns);
+
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("active-conns", ",")
-                                   : NORM_KV_32_FMT("active-conns", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("active-conns", ",")
+                                   : NORM_KV_64_FMT("active-conns", "\n"),
                           active_conns);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("history-conns", ",")
-                                   : NORM_KV_32_FMT("history-conns", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("history-conns", ",")
+                                   : NORM_KV_64_FMT("history-conns", "\n"),
                           history_conns);
 
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[c2v]packets", ",")
-                                   : NORM_KV_32_FMT("[c2v]packets", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[c2v]packets", ",")
+                                   : NORM_KV_64_FMT("[c2v]packets", "\n"),
                           rx_packets[0]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[c2v]bytes", ",")
-                                   : NORM_KV_32_FMT("[c2v]bytes", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[c2v]bytes", ",")
+                                   : NORM_KV_64_FMT("[c2v]bytes", "\n"),
                           rx_bytes[0]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[c2v]drops", ",")
-                                   : NORM_KV_32_FMT("[c2v]drops", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[c2v]drops", ",")
+                                   : NORM_KV_64_FMT("[c2v]drops", "\n"),
                           rx_drops[0]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[r2v]packets", ",")
-                                   : NORM_KV_32_FMT("[r2v]packets", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[r2v]packets", ",")
+                                   : NORM_KV_64_FMT("[r2v]packets", "\n"),
                           rx_packets[1]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[r2v]bytes", ",")
-                                   : NORM_KV_32_FMT("[r2v]bytes", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[r2v]bytes", ",")
+                                   : NORM_KV_64_FMT("[r2v]bytes", "\n"),
                           rx_bytes[1]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[r2v]drops", "")
-                                   : NORM_KV_32_FMT("[r2v]drops", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[r2v]drops", "")
+                                   : NORM_KV_64_FMT("[r2v]drops", "\n"),
                           rx_drops[1]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2r]packets", ",")
-                                   : NORM_KV_32_FMT("[v2r]packets", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[v2r]packets", ",")
+                                   : NORM_KV_64_FMT("[v2r]packets", "\n"),
                           tx_packets[0]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2r]bytes", ",")
-                                   : NORM_KV_32_FMT("[v2r]bytes", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[v2r]bytes", ",")
+                                   : NORM_KV_64_FMT("[v2r]bytes", "\n"),
                           tx_bytes[0]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2c]packets", ",")
-                                   : NORM_KV_32_FMT("[v2c]packets", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[v2c]packets", ",")
+                                   : NORM_KV_64_FMT("[v2c]packets", "\n"),
                           tx_packets[1]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2c]bytes", "")
-                                   : NORM_KV_32_FMT("[v2c]bytes", "\n"),
+                          json_fmt ? JSON_KV_64_FMT("[v2c]bytes", "")
+                                   : NORM_KV_64_FMT("[v2c]bytes", "\n"),
                           tx_bytes[1]);
 
     if (json_fmt)
@@ -1655,4 +1661,3 @@ rs_stats_cmd_cb(int fd, char *argv[], int argc) {
 UNIXCTL_CMD_REGISTER("rs/stats", "VIP:VPORT tcp|udp RIP:RPORT.",
                      "Show the packet stats of real services.", 3, 4,
                      rs_stats_cmd_cb);
-
