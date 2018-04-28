@@ -1,1 +1,7 @@
 .vscode
+cmd/x86_64-native-linuxapp-gcc
+core/x86_64-native-linuxapp-gcc
+dpdk/x86_64-native-linuxapp-gcc
+lib/libcmd/x86_64-native-linuxapp-gcc
+lib/libconhash/x86_64-native-linuxapp-gcc
+rpmbuild
