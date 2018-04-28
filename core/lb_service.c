@@ -535,11 +535,12 @@ vs_list_cmd_cb(int fd, char *argv[], int argc) {
     }
 
     VS_TBL_FOREACH_SOCKET(socket_id) {
+        static const char *vs_list_header =
+            "IP               Port   Type   Sched       Max_conns   synproxy  "
+            "toa  est_timeout\n";
         t = lb_vs_tbls[socket_id];
 
-        unixctl_command_reply(fd, json_fmt ? "["
-                                           : "IP               Port   "
-                                             "Type   Sched       Max_conns\n");
+        unixctl_command_reply(fd, json_fmt ? "[" : vs_list_header);
         while (rte_hash_iterate(t->vs_htbl, &key, (void **)&vs, &next) >= 0) {
             ipv4_addr_tostring(vs->vip, buf, sizeof(buf));
 
@@ -553,13 +554,21 @@ vs_list_cmd_cb(int fd, char *argv[], int argc) {
                                       l4proto_format(vs->proto));
                 unixctl_command_reply(fd, JSON_KV_S_FMT("sched", ","),
                                       vs->sched->name);
-                unixctl_command_reply(fd, JSON_KV_32_FMT("max_conns", "}"),
+                unixctl_command_reply(fd, JSON_KV_32_FMT("max_conns", ","),
                                       vs->max_conns);
+                unixctl_command_reply(fd, JSON_KV_32_FMT("synproxy", ","),
+                                      !!(vs->flags & LB_VS_F_SYNPROXY));
+                unixctl_command_reply(fd, JSON_KV_32_FMT("toa", ","),
+                                      !!(vs->flags & LB_VS_F_TOA));
+                unixctl_command_reply(fd, JSON_KV_32_FMT("est_timeout", "}"),
+                                      vs->est_timeout);
             } else {
-                unixctl_command_reply(fd, "%-15s  %-5u  %-5s  %-10s  %d\n", buf,
-                                      rte_be_to_cpu_16(vs->vport),
-                                      l4proto_format(vs->proto),
-                                      vs->sched->name, vs->max_conns);
+                unixctl_command_reply(
+                    fd, "%-15s  %-5u  %-5s  %-10s  %-10d  %-8u  %-3u  %-10u\n",
+                    buf, rte_be_to_cpu_16(vs->vport), l4proto_format(vs->proto),
+                    vs->sched->name, vs->max_conns,
+                    !!(vs->flags & LB_VS_F_SYNPROXY),
+                    !!(vs->flags & LB_VS_F_TOA), vs->est_timeout);
             }
         }
         if (json_fmt)
@@ -1047,7 +1056,7 @@ vs_stats_cmd_cb(int fd, char *argv[], int argc) {
                                    : NORM_KV_64_FMT("[r2v]bytes", "\n"),
                           rx_bytes[1]);
     unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[r2v]drops", "")
+                          json_fmt ? JSON_KV_64_FMT("[r2v]drops", ",")
                                    : NORM_KV_64_FMT("[r2v]drops", "\n"),
                           rx_drops[1]);
     unixctl_command_reply(fd,
@@ -1375,9 +1384,14 @@ rs_status_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
 
     if (i < argc) {
         *echo = 0;
-        rc = parser_read_uint8(op, argv[i++]);
-        if (rc < 0)
-            return i - 1;
+        if (strcmp("up", argv[i]) == 0) {
+            *op = 1;
+        } else if (strcmp("down", argv[i]) == 0) {
+            *op = 0;
+        } else {
+            return i;
+        }
+        i++;
     } else {
         *echo = 1;
     }
@@ -1422,7 +1436,8 @@ rs_status_cmd_cb(int fd, char *argv[], int argc) {
         }
 
         if (echo) {
-            unixctl_command_reply(fd, "%u\n", rs->flags & LB_RS_F_AVAILABLE);
+            unixctl_command_reply(
+                fd, "%s\n", rs->flags & LB_RS_F_AVAILABLE ? "up" : "down");
             return;
         }
 
@@ -1456,7 +1471,7 @@ failed:
     }
 }
 
-UNIXCTL_CMD_REGISTER("rs/status", "VIP:VPORT tcp|udp RIP:RPORT [0|1].",
+UNIXCTL_CMD_REGISTER("rs/status", "VIP:VPORT tcp|udp RIP:RPORT [down|up].",
                      "Show or set the status of real services.", 3, 4,
                      rs_status_cmd_cb);
 
