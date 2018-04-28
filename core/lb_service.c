@@ -59,15 +59,15 @@ vs_tbl_get_next(int sid) {
 
 int
 lb_service_init(void) {
-    uint32_t port_id, nb_ports;
+    uint16_t devid;
+    struct lb_device *dev;
     uint32_t socket_id;
     char name[RTE_HASH_NAMESIZE];
     struct rte_hash_parameters param;
     struct lb_vs_table *t;
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        socket_id = rte_eth_dev_socket_id(port_id);
+    LB_DEVICE_FOREACH(devid, dev) {
+        socket_id = dev->socket_id;
 
         if (lb_vs_tbls[socket_id] != NULL)
             continue;

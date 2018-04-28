@@ -340,7 +340,7 @@ tcp_conn_timer_task_cb(struct lb_conn *conn) {
             if (mcopy != NULL) {
                 iph = rte_pktmbuf_mtod_offset(mcopy, struct ipv4_hdr *,
                                               ETHER_HDR_LEN);
-                lb_device_output(mcopy, iph, mcopy->port);
+                lb_device_output(mcopy, iph, mcopy->userdata);
             }
         }
     }
@@ -358,35 +358,37 @@ tcp_conn_timer_expire_cb(struct lb_conn *conn, uint32_t ctime) {
 
 static struct lb_conn *
 tcp_conn_schedule(struct lb_conn_table *ct, struct ipv4_hdr *iph,
-                  struct tcp_hdr *th, uint16_t port_id) {
+                  struct tcp_hdr *th, struct lb_device *dev) {
     struct lb_virt_service *vs;
     struct lb_real_service *rs;
     struct lb_conn *conn;
 
-	if (!SYN(th) || ACK(th) || RST(th) || FIN(th))
-		return NULL;
+    if (!SYN(th) || ACK(th) || RST(th) || FIN(th))
+        return NULL;
 
-	vs = lb_vs_get(iph->dst_addr, th->dst_port, iph->next_proto_id);
-	if (vs == NULL)
-		return NULL;
+    vs = lb_vs_get(iph->dst_addr, th->dst_port, iph->next_proto_id);
+    if (vs == NULL)
+        return NULL;
 
-	if (lb_vs_check_max_conn(vs)) {
-		lb_vs_put(vs);
-		return NULL;
-	}
+    if (lb_vs_check_max_conn(vs)) {
+        lb_vs_put(vs);
+        return NULL;
+    }
 
-	rs = lb_vs_get_rs(vs, iph->src_addr, th->src_port);
-	if (rs == NULL) {
-		lb_vs_put(vs);
-		return NULL;
-	}
+    rs = lb_vs_get_rs(vs, iph->src_addr, th->src_port);
+    if (rs == NULL) {
+        lb_vs_put(vs);
+        return NULL;
+    }
 
-	conn = lb_conn_new(ct, iph->src_addr, th->src_port, rs, 0, port_id);
-	if (conn == NULL) {
-		lb_vs_put(vs);
-		lb_vs_put_rs(rs);
-		return NULL;
-	}
+    conn = lb_conn_new(ct, iph->src_addr, th->src_port, rs, 0, dev);
+    if (conn == NULL) {
+        lb_vs_put(vs);
+        lb_vs_put_rs(rs);
+        return NULL;
+    }
+
+    lb_vs_put(vs);
 
     return conn;
 }
@@ -430,7 +432,7 @@ tcp_opt_remove_timestamp(struct tcp_hdr *th) {
 
 static void
 tcp_response_rst(struct rte_mbuf *m, struct ipv4_hdr *iph, struct tcp_hdr *th,
-                 uint16_t port_id) {
+                 struct lb_device *dev) {
     uint32_t tmpaddr;
     struct tcp_hdr *nth;
     uint16_t sport, dport;
@@ -481,16 +483,16 @@ tcp_response_rst(struct rte_mbuf *m, struct ipv4_hdr *iph, struct tcp_hdr *th,
     nth->cksum = 0;
     nth->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 static int
 tcp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
                         struct tcp_hdr *th, struct lb_conn_table *ct,
-                        struct lb_conn *conn, uint16_t port_id) {
+                        struct lb_conn *conn, struct lb_device *dev) {
     if (conn != NULL) {
         if (conn->state == TCP_CONNTRACK_CLOSE) {
-            tcp_response_rst(m, iph, th, port_id);
+            tcp_response_rst(m, iph, th, dev);
             return 0;
         }
         if (conn->state == TCP_CONNTRACK_TIME_WAIT) {
@@ -509,10 +511,10 @@ tcp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
     }
 
     if (conn == NULL) {
-        if (synproxy_recv_client_ack(m, iph, th, ct, port_id) == 0) {
+        if (synproxy_recv_client_ack(m, iph, th, ct, dev) == 0) {
             return 0;
         }
-        conn = tcp_conn_schedule(ct, iph, th, port_id);
+        conn = tcp_conn_schedule(ct, iph, th, dev);
         if (conn == NULL) {
             TCP_PRINT(IPv4_TCP_FMT " [CONN SCHEDULE DROP]\n",
                       IPv4_TCP_ARG(iph, th));
@@ -535,7 +537,7 @@ tcp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
         TCP_PRINT(IPv4_TCP_FMT " [RS NOT AVAILABLE DROP]\n",
                   IPv4_TCP_ARG(iph, th));
         lb_conn_expire(ct, conn);
-        tcp_response_rst(m, iph, th, port_id);
+        tcp_response_rst(m, iph, th, dev);
         return 0;
     }
 
@@ -564,14 +566,14 @@ tcp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    return lb_device_output(m, iph, port_id);
+    return lb_device_output(m, iph, dev);
 }
 
 static int
 tcp_fullnat_recv_backend(struct rte_mbuf *m, struct ipv4_hdr *iph,
                          struct tcp_hdr *th, struct lb_conn *conn,
-                         uint16_t port_id) {
-    if (synproxy_recv_backend_synack(m, iph, th, conn, port_id) == 0)
+                         struct lb_device *dev) {
+    if (synproxy_recv_backend_synack(m, iph, th, conn, dev) == 0)
         return 0;
 
     tcp_set_conntack_state(conn, th, LB_DIR_REPLY);
@@ -588,11 +590,12 @@ tcp_fullnat_recv_backend(struct rte_mbuf *m, struct ipv4_hdr *iph,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    return lb_device_output(m, iph, port_id);
+    return lb_device_output(m, iph, dev);
 }
 
 static int
-tcp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
+tcp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph,
+                   struct lb_device *dev) {
     struct lb_conn_table *ct;
     struct lb_conn *conn;
     struct tcp_hdr *th;
@@ -603,17 +606,17 @@ tcp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
 
     TCP_PRINT(IPv4_TCP_FMT " [NEW PACKET]\n", IPv4_TCP_ARG(iph, th));
 
-    if (synproxy_recv_client_syn(m, iph, th, port_id) == 0)
+    if (synproxy_recv_client_syn(m, iph, th, dev) == 0)
         return 0;
 
     conn = lb_conn_find(ct, iph->src_addr, iph->dst_addr, th->src_port,
                         th->dst_port, &dir);
     if (dir == LB_DIR_REPLY) {
         TCP_PRINT(IPv4_TCP_FMT " [REPLY]\n", IPv4_TCP_ARG(iph, th));
-        return tcp_fullnat_recv_backend(m, iph, th, conn, port_id);
+        return tcp_fullnat_recv_backend(m, iph, th, conn, dev);
     } else {
         TCP_PRINT(IPv4_TCP_FMT " [ORIGINAL]\n", IPv4_TCP_ARG(iph, th));
-        return tcp_fullnat_recv_client(m, iph, th, ct, conn, port_id);
+        return tcp_fullnat_recv_client(m, iph, th, ct, conn, dev);
     }
 }
 
@@ -715,4 +718,3 @@ tcp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
 
 UNIXCTL_CMD_REGISTER("tcp/conn/dump", "", "Dump TCP connections.", 0, 0,
                      tcp_conn_dump_cmd_cb);
-

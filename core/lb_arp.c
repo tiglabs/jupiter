@@ -40,7 +40,7 @@ struct arp_table {
     rte_rwlock_t rwlock;
 };
 
-static struct arp_table arp_tbl[RTE_MAX_ETHPORTS];
+static struct arp_table arp_tbls[RTE_MAX_ETHPORTS];
 static uint32_t arp_timeout = 1800 * LB_CLOCK_HZ;
 
 #define ARP_TABLE_RWLOCK_RLOCK(t) rte_rwlock_read_lock(&(t)->rwlock)
@@ -78,7 +78,7 @@ arp_expire(struct rte_timer *t, void *arg) {
 }
 
 void
-lb_arp_input(struct rte_mbuf *pkt, uint16_t port_id) {
+lb_arp_input(struct rte_mbuf *pkt, struct lb_device *dev) {
     struct arp_table *tbl;
     struct arp_entry *entry;
     struct arp_hdr *arph;
@@ -86,7 +86,7 @@ lb_arp_input(struct rte_mbuf *pkt, uint16_t port_id) {
     struct ether_addr *sha;
     int i;
 
-    tbl = &arp_tbl[port_id];
+    tbl = &arp_tbls[dev->port_id];
     arph = rte_pktmbuf_mtod_offset(pkt, struct arp_hdr *, ETHER_HDR_LEN);
     sip = arph->arp_data.arp_sip;
     sha = &arph->arp_data.arp_sha;
@@ -129,18 +129,14 @@ lb_arp_input(struct rte_mbuf *pkt, uint16_t port_id) {
 static int
 arp_send(uint16_t type, uint32_t dst_ip, uint32_t src_ip,
          struct ether_addr *dst_ha, struct ether_addr *src_ha,
-         uint16_t port_id) {
+         struct lb_device *dev) {
     static const struct ether_addr bc_ha = {
         {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
-    struct lb_device *dev = &lb_devices[port_id];
     struct rte_mbuf *m;
     struct ether_hdr *eth;
     struct arp_hdr *ah;
-    uint32_t lcore_id;
-    uint16_t txq_id;
-    struct rte_eth_dev_tx_buffer *tx_buffer;
 
-    m = lb_device_pktmbuf_alloc(port_id);
+    m = lb_device_pktmbuf_alloc(dev);
     if (m == NULL) {
         RTE_LOG(WARNING, USER1, "%s(): Alloc packet mbuf failed.\n", __func__);
         return -1;
@@ -175,27 +171,21 @@ arp_send(uint16_t type, uint32_t dst_ip, uint32_t src_ip,
     m->data_len = ETHER_HDR_LEN + sizeof(*ah);
     m->pkt_len = ETHER_HDR_LEN + sizeof(*ah);
 
-    lcore_id = rte_lcore_id();
-    txq_id = dev->lcore_conf[lcore_id].txq_id;
-    tx_buffer = dev->tx_buffer[lcore_id];
-    rte_eth_tx_buffer(port_id, txq_id, tx_buffer, m);
-
+    lb_device_tx_mbuf(m, dev);
     return 0;
 }
 
 int
-lb_arp_request(uint32_t dip, uint16_t port_id) {
-    struct lb_device *dev = &lb_devices[port_id];
-
-    return arp_send(ARP_OP_REQUEST, dip, dev->ipv4, NULL, &dev->ha, port_id);
+lb_arp_request(uint32_t dip, struct lb_device *dev) {
+    return arp_send(ARP_OP_REQUEST, dip, dev->ipv4, NULL, &dev->ha, dev);
 }
 
 int
-lb_arp_find(uint32_t ip, struct ether_addr *mac, uint16_t port_id) {
+lb_arp_find(uint32_t ip, struct ether_addr *mac, struct lb_device *dev) {
     struct arp_table *tbl;
     int i;
 
-    tbl = &arp_tbl[port_id];
+    tbl = &arp_tbls[dev->port_id];
     ARP_TABLE_RWLOCK_RLOCK(tbl);
     i = rte_hash_lookup(tbl->hash, &ip);
     if (i >= 0) {
@@ -209,20 +199,16 @@ lb_arp_find(uint32_t ip, struct ether_addr *mac, uint16_t port_id) {
 
 int
 lb_arp_init(void) {
-    uint16_t nb_ports, i;
+    uint16_t i;
+    struct lb_device *dev;
     struct rte_hash_parameters params;
     char name[RTE_HASH_NAMESIZE];
     int socket_id;
+    struct arp_table *tbl;
 
-    nb_ports = rte_eth_dev_count();
-    for (i = 0; i < nb_ports; i++) {
-        if (lb_devices[i].type != LB_DEV_T_NORM &&
-            lb_devices[i].type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
-        socket_id = rte_eth_dev_socket_id(i);
-
+    LB_DEVICE_FOREACH(i, dev) {
+        tbl = &arp_tbls[dev->port_id];
+        socket_id = dev->socket_id;
         memset(&params, 0, sizeof(params));
         snprintf(name, sizeof(name), "arphash%u", i);
         params.name = name;
@@ -231,28 +217,28 @@ lb_arp_init(void) {
         params.hash_func = rte_hash_crc;
         params.socket_id = socket_id;
 
-        arp_tbl[i].hash = rte_hash_create(&params);
-        if (arp_tbl[i].hash == NULL) {
+        tbl->hash = rte_hash_create(&params);
+        if (tbl->hash == NULL) {
             RTE_LOG(ERR, USER1, "%s(): Create arp hash (%s) failed, %s.\n",
                     __func__, name, rte_strerror(rte_errno));
             return -1;
         }
 
-        arp_tbl[i].entries =
+        tbl->entries =
             rte_zmalloc_socket(NULL, LB_MAX_ARP * sizeof(struct arp_entry),
                                RTE_CACHE_LINE_SIZE, socket_id);
-        if (arp_tbl[i].entries == NULL) {
+        if (tbl->entries == NULL) {
             RTE_LOG(ERR, USER1, "%s(): Alloc memory for arp table failed.\n",
                     __func__);
             return -1;
         }
-        rte_rwlock_init(&arp_tbl[i].rwlock);
+        rte_rwlock_init(&tbl->rwlock);
 
-        arp_tbl[i].timeout = arp_timeout;
+        tbl->timeout = arp_timeout;
 
         RTE_LOG(INFO, USER1,
                 "%s(): Create arp table for port(%s) on socket%d.\n", __func__,
-                lb_devices[i].name, socket_id);
+                dev->name, socket_id);
     }
 
     return 0;
@@ -261,7 +247,9 @@ lb_arp_init(void) {
 static void
 arp_list_cb(int fd, __attribute__((unused)) char *argv[],
             __attribute__((unused)) int argc) {
-    uint16_t nb_ports, i;
+    uint16_t i;
+    struct lb_device *dev;
+    struct arp_table *tbl;
     const void *key;
     void *data;
     uint32_t next;
@@ -273,24 +261,18 @@ arp_list_cb(int fd, __attribute__((unused)) char *argv[],
     unixctl_command_reply(
         fd, "IPaddress        HWaddress          Iface       AliveTime\n");
 
-    nb_ports = rte_eth_dev_count();
     ctime = LB_CLOCK();
 
-    for (i = 0; i < nb_ports; i++) {
-        if (lb_devices[i].type != LB_DEV_T_NORM &&
-            lb_devices[i].type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(i, dev) {
+        tbl = &arp_tbls[dev->port_id];
         next = 0;
-        while ((rc = rte_hash_iterate(arp_tbl[i].hash, &key, &data, &next)) >=
-               0) {
-            entry = &arp_tbl[i].entries[rc];
+        while ((rc = rte_hash_iterate(tbl->hash, &key, &data, &next)) >= 0) {
+            entry = &tbl->entries[rc];
             ipv4_addr_tostring(entry->ip, ip, sizeof(ip));
             mac_addr_tostring(&entry->ha, mac, sizeof(mac));
             sec = LB_CLOCK_TO_SEC(ctime - entry->create_time);
             unixctl_command_reply(fd, "%-15s  %-17s  %-10s  %u\n", ip, mac,
-                                  lb_devices[i].name, sec);
+                                  dev->name, sec);
         }
     }
 }
@@ -301,7 +283,9 @@ static void
 arp_timeout_cb(int fd, char *argv[], int argc) {
     uint32_t timeout, echo = 0;
     int rc;
-    uint16_t nb_ports, i;
+    uint16_t i;
+    struct lb_device *dev;
+    struct arp_table *tbl;
 
     if (argc == 0) {
         echo = 1;
@@ -315,22 +299,15 @@ arp_timeout_cb(int fd, char *argv[], int argc) {
         timeout = SEC_TO_LB_CLOCK(timeout);
     }
 
-    nb_ports = rte_eth_dev_count();
-    for (i = 0; i < nb_ports; i++) {
-        if (lb_devices[i].type != LB_DEV_T_NORM &&
-            lb_devices[i].type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(i, dev) {
+        tbl = &arp_tbls[dev->port_id];
         if (echo) {
-            unixctl_command_reply(fd, "%u\n",
-                                  LB_CLOCK_TO_SEC(arp_tbl[i].timeout));
+            unixctl_command_reply(fd, "%u\n", LB_CLOCK_TO_SEC(tbl->timeout));
             return;
         } else {
-            arp_tbl[i].timeout = timeout;
+            tbl->timeout = timeout;
         }
     }
 }
 
 UNIXCTL_CMD_REGISTER("arp/timeout", "[SEC].", "", 0, 1, arp_timeout_cb);
-

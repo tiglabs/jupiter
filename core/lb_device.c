@@ -14,6 +14,7 @@
 #include <rte_byteorder.h>
 #include <rte_cycles.h>
 #include <rte_errno.h>
+#include <rte_eth_bond.h>
 #include <rte_eth_ctrl.h>
 #include <rte_ethdev.h>
 #include <rte_kni.h>
@@ -24,11 +25,15 @@
 
 #include <unixctl_command.h>
 
+#include "lb_config.h"
 #include "lb_device.h"
 #include "lb_format.h"
 #include "lb_parser.h"
 
-struct lb_device lb_devices[RTE_MAX_ETHPORTS];
+#define LB_PKTMBUF_POOL_DEFAULT_SIZE 4096
+
+struct lb_device *lb_devices[RTE_MAX_ETHPORTS];
+uint16_t lb_device_count;
 
 static int
 __fdir_filter_input_set(uint16_t port_id, uint32_t flow_type,
@@ -87,9 +92,10 @@ dpdk_dev_fdir_filter_add(uint16_t port_id, uint32_t dst_ip, uint32_t rxq_id) {
     if (!input_set_once[port_id]) {
         rc = _fdir_filter_input_set(port_id);
         if (rc < 0) {
-            RTE_LOG(WARNING, USER1,
-                    "%s(): Unsupport FDIR input set configuration, %s.\n",
-                    __func__, lb_devices[port_id].name);
+            RTE_LOG(
+                WARNING, USER1,
+                "%s(): Port%u doesn't support FDIR input set configuration.\n",
+                __func__, port_id);
         }
         input_set_once[port_id] = 1;
     }
@@ -98,27 +104,25 @@ dpdk_dev_fdir_filter_add(uint16_t port_id, uint32_t dst_ip, uint32_t rxq_id) {
                           rxq_id);
     if (rc < 0) {
         RTE_LOG(ERR, USER1,
-                "%s(): Add FDIR fileter on device %s failed, "
+                "%s(): Port%u add FDIR fileter failed, "
                 "type:NONFRAG_IPV4_TCP, dst-ip:" IPv4_BE_FMT ", rxq:%u\n",
-                __func__, lb_devices[port_id].name, IPv4_BE_ARG(dst_ip),
-                rxq_id);
+                __func__, port_id, IPv4_BE_ARG(dst_ip), rxq_id);
         return rc;
     }
     rc = _fdir_filter_add(port_id, RTE_ETH_FLOW_NONFRAG_IPV4_UDP, dst_ip,
                           rxq_id);
     if (rc < 0) {
         RTE_LOG(ERR, USER1,
-                "%s(): Add FDIR fileter on device %s failed, "
+                "%s(): Port%u add FDIR fileter failed, "
                 "type:NONFRAG_IPV4_UDP, dst-ip:" IPv4_BE_FMT ", rxq:%u\n",
-                __func__, lb_devices[port_id].name, IPv4_BE_ARG(dst_ip),
-                rxq_id);
+                __func__, port_id, IPv4_BE_ARG(dst_ip), rxq_id);
         return rc;
     }
     RTE_LOG(INFO, USER1,
-            "%s(): Add FDIR filter on device %s, "
+            "%s(): Port%u add FDIR filter, "
             "type:NONFRAG_IPV4_TCP|NONFRAG_IPV4_UDP, dst-ip:" IPv4_BE_FMT
             ", rxq:%u\n",
-            __func__, lb_devices[port_id].name, IPv4_BE_ARG(dst_ip), rxq_id);
+            __func__, port_id, IPv4_BE_ARG(dst_ip), rxq_id);
     return 0;
 }
 
@@ -136,13 +140,15 @@ dpdk_dev_5tuple_filter_add(uint16_t port_id, uint32_t dst_ip, uint32_t rxq_id) {
     rc = rte_eth_dev_filter_ctrl(port_id, RTE_ETH_FILTER_NTUPLE,
                                  RTE_ETH_FILTER_ADD, &ntuple);
     if (rc < 0) {
-        RTE_LOG(ERR, USER1, "%s(): Device %s add 5Tuple filter failed.\n",
-                __func__, lb_devices[port_id].name);
+        RTE_LOG(ERR, USER1,
+                "%s(): Port%u add 5Tuple filter failed, dst-ip:" IPv4_BE_FMT
+                ", rxq:%u.\n",
+                __func__, port_id, IPv4_BE_ARG(dst_ip), rxq_id);
         return rc;
     }
     RTE_LOG(INFO, USER1,
-            "%s(): Add 5Tuple filter, dst-ip:" IPv4_BE_FMT ", rxq:%u\n",
-            __func__, IPv4_BE_ARG(dst_ip), rxq_id);
+            "%s(): Port%u add 5Tuple filter, dst-ip:" IPv4_BE_FMT ", rxq:%u\n",
+            __func__, port_id, IPv4_BE_ARG(dst_ip), rxq_id);
     return rc;
 }
 
@@ -152,15 +158,15 @@ dpdk_dev_filter_add(uint16_t port_id, uint32_t dst_ip, uint32_t rxq_id) {
         return dpdk_dev_5tuple_filter_add(port_id, dst_ip, rxq_id);
     }
 
-    RTE_LOG(ERR, USER1, "%s(): Device %s does not support 5Tuple filter.\n",
-            __func__, lb_devices[port_id].name);
+    RTE_LOG(ERR, USER1, "%s(): Port%u does not support 5Tuple filter.\n",
+            __func__, port_id);
 
     if (rte_eth_dev_filter_supported(port_id, RTE_ETH_FILTER_FDIR) == 0) {
         return dpdk_dev_fdir_filter_add(port_id, dst_ip, rxq_id);
     }
 
-    RTE_LOG(ERR, USER1, "%s(): Device %s does not support FDIR filter.\n",
-            __func__, lb_devices[port_id].name);
+    RTE_LOG(ERR, USER1, "%s(): Port%u does not support FDIR filter.\n",
+            __func__, port_id);
 
     return -1;
 }
@@ -226,92 +232,12 @@ l4_ports_create(const char *name, uint16_t min, uint16_t max,
 }
 
 static int
-laddr_init(int port_id) {
-    struct lb_device *dev;
-    uint32_t i, socket_id, lcore_id;
-    struct lb_laddr_list *laddr_list;
-    struct lb_laddr *laddr;
-    char name[RTE_RING_NAMESIZE];
-    int rc;
-
-    dev = &lb_devices[port_id];
-    socket_id = rte_eth_dev_socket_id(port_id);
-    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        laddr_list = &dev->laddr_list[lcore_id];
-        for (i = 0; i < laddr_list->nb; i++) {
-            laddr = &laddr_list->entries[i];
-
-            snprintf(name, sizeof(name), "tcpport%p", laddr);
-            laddr->ports[LB_IPPROTO_TCP] = l4_ports_create(
-                name, LB_MIN_L4_PORT, LB_MAX_L4_PORT, socket_id);
-
-            snprintf(name, sizeof(name), "udpport%p", laddr);
-            laddr->ports[LB_IPPROTO_UDP] = l4_ports_create(
-                name, LB_MIN_L4_PORT, LB_MAX_L4_PORT, socket_id);
-
-            if (laddr->ports[LB_IPPROTO_TCP] == NULL ||
-                laddr->ports[LB_IPPROTO_UDP] == NULL) {
-                RTE_LOG(ERR, USER1, "%s(): l4_ports_create failed.\n",
-                        __func__);
-                return -1;
-            }
-
-            rc = dpdk_dev_filter_add(port_id, laddr->ipv4, laddr->rxq_id);
-            if (rc < 0) {
-                RTE_LOG(ERR, USER1, "%s(): dpdk_dev_filter_add failed.\n",
-                        __func__);
-                return rc;
-            }
-        }
-    }
-    return 0;
-}
-
-static int
-dpdk_device_init(int port_id) {
-    struct lb_device *dev;
-    struct rte_eth_dev_info info;
+dpdk_dev_config_and_set_ipfilter(uint16_t port_id, struct lb_device *dev,
+                                 uint8_t ipfilter_enabled) {
     struct rte_eth_conf dev_conf;
-    uint16_t i;
-    uint32_t socket_id;
-    uint32_t mp_size;
-    char mp_name[RTE_MEMPOOL_NAMESIZE];
-    struct rte_kni_conf kni_conf;
-    struct rte_kni_ops kni_ops;
     int rc;
+    uint16_t i;
 
-    dev = &lb_devices[port_id];
-
-    /* 0) Get device hardware info. */
-    rte_eth_dev_info_get(port_id, &info);
-    dev->rxq_size = RTE_MIN(dev->rxq_size, info.rx_desc_lim.nb_max);
-    dev->rxq_size = RTE_MAX(dev->rxq_size, info.rx_desc_lim.nb_min);
-    dev->txq_size = RTE_MIN(dev->txq_size, info.tx_desc_lim.nb_max);
-    dev->txq_size = RTE_MAX(dev->txq_size, info.tx_desc_lim.nb_min);
-    dev->mtu =
-        RTE_MIN(dev->mtu, info.max_rx_pktlen - ETHER_HDR_LEN - ETHER_CRC_LEN);
-    dev->mtu = RTE_MAX(dev->mtu, ETHER_MIN_MTU);
-
-    /* 1) Create pktmbuf mempool for RX queue. */
-    socket_id = rte_eth_dev_socket_id(port_id);
-    mp_size = dev->nb_rxq * dev->rxq_size + dev->nb_txq * dev->txq_size;
-    snprintf(mp_name, sizeof(mp_name), "mp%p", dev);
-    dev->mp = rte_pktmbuf_pool_create(mp_name, mp_size,
-                                      /* cache_size */
-                                      32,
-                                      /* priv_size */
-                                      0,
-                                      /* data_room_size */
-                                      dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
-                                          RTE_PKTMBUF_HEADROOM,
-                                      socket_id);
-    if (dev->mp == NULL) {
-        RTE_LOG(ERR, USER1, "%s(): Create pktmbuf mempool failed, %s.\n",
-                __func__, rte_strerror(rte_errno));
-        return -1;
-    }
-
-    /* 2) Config and start device. */
     memset(&dev_conf, 0, sizeof(dev_conf));
     dev_conf.rxmode.mq_mode = ETH_MQ_RX_RSS;
     if (dev->mtu > ETHER_MTU) {
@@ -326,6 +252,7 @@ dpdk_device_init(int port_id) {
     dev_conf.fdir_conf.mask.src_port_mask = 0xFFFF;
     dev_conf.fdir_conf.mask.dst_port_mask = 0xFFFF;
     dev_conf.fdir_conf.drop_queue = 127;
+
     rc = rte_eth_dev_configure(port_id, dev->nb_rxq, dev->nb_txq, &dev_conf);
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "%s(): config port%u failed, %s.\n", __func__,
@@ -334,8 +261,8 @@ dpdk_device_init(int port_id) {
     }
 
     for (i = 0; i < dev->nb_rxq; i++) {
-        rc = rte_eth_rx_queue_setup(port_id, i, dev->rxq_size, socket_id, NULL,
-                                    dev->mp);
+        rc = rte_eth_rx_queue_setup(port_id, i, dev->rxq_size, dev->socket_id,
+                                    NULL, dev->mp);
         if (rc < 0) {
             RTE_LOG(ERR, USER1, "%s(): Setup the rxq%u of port%u failed, %s.\n",
                     __func__, i, port_id, strerror(-rc));
@@ -344,7 +271,8 @@ dpdk_device_init(int port_id) {
     }
 
     for (i = 0; i < dev->nb_txq; i++) {
-        rc = rte_eth_tx_queue_setup(port_id, i, dev->txq_size, socket_id, NULL);
+        rc = rte_eth_tx_queue_setup(port_id, i, dev->txq_size, dev->socket_id,
+                                    NULL);
         if (rc < 0) {
             RTE_LOG(ERR, USER1, "%s(): Setup the txq%u of port%u failed, %s.\n",
                     __func__, i, port_id, strerror(-rc));
@@ -354,144 +282,364 @@ dpdk_device_init(int port_id) {
 
     rte_eth_promiscuous_enable(port_id);
 
-    /* 3)  Create KNI. */
-    if (dev->type == LB_DEV_T_NORM || dev->type == LB_DEV_T_MASTER) {
-        memset(&kni_conf, 0, sizeof(kni_conf));
-        memcpy(kni_conf.name, dev->name, RTE_KNI_NAMESIZE);
-        kni_conf.core_id = 0;
-        kni_conf.force_bind = 1;
-        kni_conf.group_id = port_id;
-        kni_conf.mbuf_size =
-            dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
-        kni_conf.addr = info.pci_dev->addr;
-        kni_conf.id = info.pci_dev->id;
-
-        kni_ops.port_id = port_id;
-        kni_ops.change_mtu = NULL;
-        kni_ops.config_network_if = NULL;
-
-        dev->kni = rte_kni_alloc(dev->mp, &kni_conf, &kni_ops);
-        if (dev->kni == NULL) {
-            RTE_LOG(ERR, USER1, "%s(): Create kni %s failed.\n", __func__,
-                    dev->name);
-            return -1;
-        }
-
-        if (kni_get_mac(dev->name, &dev->ha) < 0) {
-            RTE_LOG(ERR, USER1, "%s(): kni_set_mac failed.\n", __func__);
-            return -1;
-        }
-    }
-
-    /* 4) Create tx buffers. */
-    if (dev->type == LB_DEV_T_NORM || dev->type == LB_DEV_T_MASTER) {
+    if (ipfilter_enabled && dev->nb_rxq > 1) {
         uint32_t lcore_id;
 
-        RTE_LCORE_FOREACH(lcore_id) {
-            if (lcore_id != rte_get_master_lcore() &&
-                socket_id != rte_lcore_to_socket_id(lcore_id)) {
-                continue;
+        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+            struct lb_laddr_list *laddr_list;
+            struct lb_laddr *laddr;
+            uint32_t lid;
+
+            laddr_list = &dev->laddr_list[lcore_id];
+            for (lid = 0; lid < laddr_list->nb; lid++) {
+                laddr = &laddr_list->entries[lid];
+                rc = dpdk_dev_filter_add(port_id, laddr->ipv4, laddr->rxq_id);
+                if (rc < 0) {
+                    RTE_LOG(ERR, USER1, "%s(): dpdk_dev_filter_add failed.\n",
+                            __func__);
+                    return rc;
+                }
             }
-            dev->tx_buffer[lcore_id] = rte_zmalloc_socket(
-                "tx-buffer", RTE_ETH_TX_BUFFER_SIZE(PKT_MAX_BURST),
-                RTE_CACHE_LINE_SIZE, socket_id);
-            if (dev->tx_buffer[lcore_id] == NULL) {
-                RTE_LOG(ERR, USER1, "%s(): Create tx pkt buffer failed.\n",
-                        __func__);
+        }
+    }
+    return 0;
+}
+
+static int
+dpdk_dev_port_id_get_by_pci(struct rte_pci_addr *pci) {
+    char pci_name[PCI_PRI_STR_SIZE];
+    int rc;
+    uint16_t port_id;
+
+    rte_pci_device_name(pci, pci_name, sizeof(pci_name));
+    rc = rte_eth_dev_get_port_by_name(pci_name, &port_id);
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "%s(): Get port id from pci address(%s) failed.\n",
+                __func__, pci_name);
+        return rc;
+    }
+    return port_id;
+}
+
+static int
+dpdk_dev_socket_id_get_by_pci(struct rte_pci_addr *pci) {
+    uint16_t port_id;
+    int rc;
+
+    /* a) Get the port id by pci address. */
+    rc = dpdk_dev_port_id_get_by_pci(pci);
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "%s(): Get port id failed.\n", __func__);
+        return rc;
+    }
+    port_id = rc;
+
+    /* b) Get the socket id by port id. */
+    rc = rte_eth_dev_socket_id(port_id);
+    if (rc < 0) {
+        RTE_LOG(WARNING, USER1, "%s(): Get the socket id of port%u failed.\n",
+                __func__, port_id);
+        rc = 0;
+    }
+
+    return rc;
+}
+
+static int
+lb_device_conf_check_and_adjust(struct lb_device_conf configs[], uint16_t num) {
+    uint16_t i, j;
+    struct lb_device_conf *conf;
+    struct rte_eth_dev_info info;
+    int port_id;
+    uint8_t all_ports[RTE_MAX_ETHPORTS] = {0};
+
+    for (i = 0; i < num; i++) {
+        conf = &configs[i];
+        for (j = 0; j < conf->nb_pcis; j++) {
+            port_id = dpdk_dev_port_id_get_by_pci(&conf->pcis[j]);
+            if (port_id < 0) {
+                RTE_LOG(ERR, USER1, "%s(): Get port id failed.\n", __func__);
                 return -1;
             }
 
-            rte_eth_tx_buffer_init(dev->tx_buffer[lcore_id], PKT_MAX_BURST);
-            rte_eth_tx_buffer_set_err_callback(dev->tx_buffer[lcore_id],
-                                               tx_buffer_callback, dev);
+            /* Check duplicate ports. */
+            all_ports[port_id]++;
+            if (all_ports[port_id] > 1) {
+                char pci_name[PCI_PRI_STR_SIZE];
+                rte_pci_device_name(&conf->pcis[j], pci_name, sizeof(pci_name));
+                RTE_LOG(ERR, USER1, "%s(): Duplicate ports, %s.\n", __func__,
+                        pci_name);
+                return -1;
+            }
+
+            /* Adjust queue_size, mtu .*/
+            rte_eth_dev_info_get(port_id, &info);
+            conf->rxqsize = RTE_MIN(conf->rxqsize, info.rx_desc_lim.nb_max);
+            conf->rxqsize = RTE_MAX(conf->rxqsize, info.rx_desc_lim.nb_min);
+            conf->txqsize = RTE_MIN(conf->txqsize, info.tx_desc_lim.nb_max);
+            conf->txqsize = RTE_MAX(conf->txqsize, info.tx_desc_lim.nb_min);
+            conf->mtu = RTE_MIN(conf->mtu, info.max_rx_pktlen - ETHER_HDR_LEN -
+                                               ETHER_CRC_LEN);
+            conf->mtu = RTE_MAX(conf->mtu, ETHER_MIN_MTU);
         }
     }
+    return 0;
+}
 
-    /* 5) Create master-worker ring. */
-    if (dev->type == LB_DEV_T_NORM || dev->type == LB_DEV_T_MASTER) {
-        char rname[RTE_RING_NAMESIZE];
-        uint32_t size;
+static int
+init_mempool(struct lb_device *dev) {
+    uint32_t mp_size;
+    char mp_name[RTE_MEMPOOL_NAMESIZE];
 
-        snprintf(rname, sizeof(rname), "ring%p", dev);
-        size = PKT_MAX_BURST * dev->nb_rxq;
-        dev->ring = rte_ring_create(rname, size, socket_id,
-                                    RING_F_SC_DEQ | RING_F_EXACT_SZ);
-        if (dev->ring == NULL) {
-            RTE_LOG(ERR, USER1, "%s(): Create master-worker ring failed.\n",
+    mp_size = dev->nb_rxq * dev->rxq_size + dev->nb_txq * dev->txq_size;
+    mp_size += LB_PKTMBUF_POOL_DEFAULT_SIZE;
+    snprintf(mp_name, sizeof(mp_name), "mp%p", dev);
+    dev->mp = rte_pktmbuf_pool_create(mp_name, mp_size,
+                                      /* cache_size */
+                                      32,
+                                      /* priv_size */
+                                      0,
+                                      /* data_room_size */
+                                      dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
+                                          RTE_PKTMBUF_HEADROOM,
+                                      dev->socket_id);
+    if (dev->mp == NULL) {
+        RTE_LOG(ERR, USER1, "%s(): Create pktmbuf mempool failed, %s.\n",
+                __func__, rte_strerror(rte_errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int
+init_kni(struct lb_device *dev) {
+    struct rte_kni_conf kni_conf;
+    struct rte_kni_ops kni_ops;
+    struct rte_eth_dev_info info;
+
+    memset(&info, 0, sizeof(info));
+    rte_eth_dev_info_get(dev->port_id, &info);
+
+    memset(&kni_conf, 0, sizeof(kni_conf));
+    memcpy(kni_conf.name, dev->name, RTE_KNI_NAMESIZE);
+    kni_conf.core_id = 0;
+    kni_conf.force_bind = 1;
+    kni_conf.group_id = dev->port_id;
+    kni_conf.mbuf_size =
+        dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
+    if (info.pci_dev) {
+        kni_conf.addr = info.pci_dev->addr;
+        kni_conf.id = info.pci_dev->id;
+    }
+
+    kni_ops.port_id = dev->port_id;
+    kni_ops.change_mtu = NULL;
+    kni_ops.config_network_if = NULL;
+
+    dev->kni = rte_kni_alloc(dev->mp, &kni_conf, &kni_ops);
+    if (dev->kni == NULL) {
+        RTE_LOG(ERR, USER1, "%s(): Create kni %s failed.\n", __func__,
+                dev->name);
+        return -1;
+    }
+
+    if (kni_get_mac(dev->name, &dev->ha) < 0) {
+        RTE_LOG(ERR, USER1, "%s(): kni_set_mac failed.\n", __func__);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+init_master_worker_ring(struct lb_device *dev) {
+    char rname[RTE_RING_NAMESIZE];
+    uint32_t size;
+
+    snprintf(rname, sizeof(rname), "ring%p", dev);
+    size = PKT_MAX_BURST * dev->nb_rxq;
+    dev->ring = rte_ring_create(rname, size, dev->socket_id,
+                                RING_F_SC_DEQ | RING_F_EXACT_SZ);
+    if (dev->ring == NULL) {
+        RTE_LOG(ERR, USER1, "%s(): Create master-worker ring failed.\n",
+                __func__);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+init_tx_buffer(struct lb_device *dev) {
+    uint32_t lcore_id, socket_id;
+
+    socket_id = dev->socket_id;
+    RTE_LCORE_FOREACH(lcore_id) {
+        if (lcore_id != rte_get_master_lcore() &&
+            socket_id != rte_lcore_to_socket_id(lcore_id)) {
+            continue;
+        }
+        dev->tx_buffer[lcore_id] = rte_zmalloc_socket(
+            "tx-buffer", RTE_ETH_TX_BUFFER_SIZE(PKT_MAX_BURST),
+            RTE_CACHE_LINE_SIZE, socket_id);
+        if (dev->tx_buffer[lcore_id] == NULL) {
+            RTE_LOG(ERR, USER1, "%s(): Create tx pkt buffer failed.\n",
                     __func__);
             return -1;
         }
+
+        rte_eth_tx_buffer_init(dev->tx_buffer[lcore_id], PKT_MAX_BURST);
+        rte_eth_tx_buffer_set_err_callback(dev->tx_buffer[lcore_id],
+                                           tx_buffer_callback, dev);
+    }
+    return 0;
+}
+
+static uint32_t
+rxq_to_lcore_id(struct lb_device *dev, uint16_t rxq_id) {
+    uint32_t lcore_id;
+
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        if (dev->lcore_conf[lcore_id].rxq_enable &&
+            (dev->lcore_conf[lcore_id].rxq_id == rxq_id))
+            return lcore_id;
+    }
+    return lcore_id;
+}
+
+static int
+init_laddr_list(struct lb_device *dev, uint32_t lips[], uint32_t nb_lips) {
+    uint32_t i;
+    uint16_t rxq_id;
+    uint32_t lcore_id;
+    struct lb_laddr_list *laddr_list;
+    struct lb_laddr *laddr;
+    char name[RTE_RING_NAMESIZE];
+
+    if (nb_lips < dev->nb_rxq) {
+        RTE_LOG(ERR, USER1,
+                "%s(): The number of local IPv4 is less than the number of "
+                "RX queue of %s.\n",
+                __func__, dev->name);
+        return -1;
     }
 
-    /* 6) Create local address. */
-    if (dev->type == LB_DEV_T_NORM || dev->type == LB_DEV_T_MASTER) {
-        rc = laddr_init(port_id);
-        if (rc < 0) {
-            RTE_LOG(ERR, USER1, "%s(): Create local address failed.\n",
-                    __func__);
+    for (i = 0; i < nb_lips; i++) {
+        rxq_id = i % dev->nb_rxq;
+        lcore_id = rxq_to_lcore_id(dev, rxq_id);
+        if (lcore_id == RTE_MAX_LCORE) {
+            RTE_LOG(ERR, USER1,
+                    "%s(): rxq_to_lcore_id failed: dev=%s, rxqid=%u.\n",
+                    __func__, dev->name, rxq_id);
+            return -1;
+        }
+
+        laddr_list = &dev->laddr_list[lcore_id];
+        laddr = &laddr_list->entries[laddr_list->nb++];
+
+        laddr->ipv4 = lips[i];
+        laddr->port_id = dev->port_id;
+        laddr->rxq_id = rxq_id;
+
+        snprintf(name, sizeof(name), "tcpport%p", laddr);
+        laddr->ports[LB_IPPROTO_TCP] = l4_ports_create(
+            name, LB_MIN_L4_PORT, LB_MAX_L4_PORT, dev->socket_id);
+
+        snprintf(name, sizeof(name), "udpport%p", laddr);
+        laddr->ports[LB_IPPROTO_UDP] = l4_ports_create(
+            name, LB_MIN_L4_PORT, LB_MAX_L4_PORT, dev->socket_id);
+
+        if (laddr->ports[LB_IPPROTO_TCP] == NULL ||
+            laddr->ports[LB_IPPROTO_UDP] == NULL) {
+            RTE_LOG(ERR, USER1, "%s(): l4_ports_create failed.\n", __func__);
             return -1;
         }
     }
-
-    rc = rte_eth_dev_start(port_id);
-    if (rc < 0) {
-        RTE_LOG(ERR, USER1, "%s(): Start port%u failed, %s.\n", __func__,
-                port_id, strerror(-rc));
-        return rc;
-    }
-
     return 0;
 }
 
 int
 lb_device_init(struct lb_device_conf *configs, uint16_t num) {
-	struct lb_device_conf *conf;
-    uint16_t i, port_id;
+    uint16_t i, j;
     int rc;
-    char pci_name[PCI_PRI_STR_SIZE];
-    uint32_t socket_id, lcore_id;
+    struct lb_device_conf *conf;
     struct lb_device *dev;
+    int socket_id;
+    uint32_t lcore_id;
     uint16_t qid;
-    struct lb_laddr_list *laddr_list;
-    uint32_t j = 0, avg, lip_id;
 
-    RTE_LOG(INFO, USER1, "%s(): lb_devces[%u] size = %luKB\n", __func__,
-            RTE_MAX_ETHPORTS, (sizeof(lb_devices) + 1023) / 1024);
+    rc = lb_device_conf_check_and_adjust(configs, num);
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "%s(): Check device config failed.\n", __func__);
+        return rc;
+    }
 
-    /* 0) Initialize kni. */
     rte_kni_init(num);
 
-    /* 1) Initialize normal device. */
     for (i = 0; i < num; i++) {
-		conf = &configs[i];
+        conf = &configs[i];
 
-		if (conf->nb_pcis != 1)
-			continue;
-
-        /* a) Get the port id by pci address. */
-        rte_pci_device_name(&conf->pcis[0], pci_name, sizeof(pci_name));
-        rc = rte_eth_dev_get_port_by_name(pci_name, &port_id);
-        if (rc < 0) {
-            RTE_LOG(ERR, USER1,
-                    "%s(): Get port id from pci address(%s) failed.\n",
-                    __func__, pci_name);
-            return rc;
+        /* Get the socket id by pci. */
+        socket_id = -1;
+        for (j = 0; j < conf->nb_pcis; j++) {
+            int tmp_sid;
+            tmp_sid = dpdk_dev_socket_id_get_by_pci(&conf->pcis[j]);
+            if (tmp_sid < 0) {
+                RTE_LOG(ERR, USER1, "%s(): Get socket id by pci failed.\n",
+                        __func__);
+                return -1;
+            }
+            if (socket_id != -1 && socket_id != tmp_sid) {
+                RTE_LOG(WARNING, USER1, "%s(): Slave port on different NUMA.\n",
+                        __func__);
+                continue;
+            }
+            socket_id = tmp_sid;
         }
 
-        /* b) Get the socket id by port id. */
-        rc = rte_eth_dev_socket_id(port_id);
-        if (rc < 0) {
-            RTE_LOG(ERR, USER1, "%s(): Get the socket id of port%u failed.\n",
-                    __func__, port_id);
-            return rc;
+        dev = rte_zmalloc_socket("dev", sizeof(*dev), RTE_CACHE_LINE_SIZE,
+                                 socket_id);
+        if (dev == NULL) {
+            RTE_LOG(ERR, USER1, "%s(): Alloc memory for dev failed.\n",
+                    __func__);
+            return -1;
         }
-        socket_id = rc;
 
-        /* c) Get the lcores by socket id. */
-        dev = &lb_devices[port_id];
+        lb_devices[i] = dev;
+        lb_device_count++;
+
+        dev->socket_id = socket_id;
+
+        if (conf->nb_pcis > 1) {
+            char bond_name[32];
+            snprintf(bond_name, sizeof(bond_name), "net_bonding%u", i);
+            rc = rte_eth_bond_create(bond_name, conf->mode, dev->socket_id);
+            if (rc < 0) {
+                RTE_LOG(ERR, USER1,
+                        "%s(): Create bond device failed: dev_name=%s, "
+                        "bond_name=%s, mode=%u, socket_id=%u.\n",
+                        __func__, conf->name, bond_name, conf->mode,
+                        dev->socket_id);
+                return rc;
+            }
+            dev->type = LB_DEV_T_BOND;
+            dev->port_id = rc;
+            for (i = 0; i < conf->nb_pcis; i++) {
+                dev->slave_ports[dev->nb_slaves++] =
+                    dpdk_dev_port_id_get_by_pci(&conf->pcis[i]);
+            }
+        } else {
+            rc = dpdk_dev_port_id_get_by_pci(&conf->pcis[0]);
+            if (rc < 0) {
+                RTE_LOG(ERR, USER1, "%s(): Get port id from pci failed.\n",
+                        __func__);
+                return rc;
+            }
+            dev->type = LB_DEV_T_NORM;
+            dev->port_id = rc;
+        }
+
         qid = 0;
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            if (rte_lcore_to_socket_id(lcore_id) == socket_id) {
+            if (rte_lcore_to_socket_id(lcore_id) == dev->socket_id) {
                 dev->lcore_conf[lcore_id].rxq_enable = 1;
                 dev->lcore_conf[lcore_id].rxq_id = qid;
                 dev->lcore_conf[lcore_id].txq_id = qid;
@@ -504,7 +652,6 @@ lb_device_init(struct lb_device_conf *configs, uint16_t num) {
         dev->nb_rxq = qid;
         dev->nb_txq = qid + 1;
 
-        /* d) Copy config info to device. */
         dev->rxq_size = conf->rxqsize;
         dev->txq_size = conf->txqsize;
         dev->rx_offload = conf->rxoffload;
@@ -515,51 +662,72 @@ lb_device_init(struct lb_device_conf *configs, uint16_t num) {
         dev->mtu = conf->mtu;
         memcpy(dev->name, conf->name, sizeof(dev->name));
 
-        avg = conf->nb_lips / dev->nb_rxq;
-        if (avg == 0) {
-            RTE_LOG(ERR, USER1,
-                    "%s(): The number of local IPv4 is less than the number of "
-                    "RX queue of %s.\n",
-                    __func__, dev->name);
-            return -1;
-        }
-        lip_id = 0;
-        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            laddr_list = &dev->laddr_list[lcore_id];
-            laddr_list->nb = avg;
-            for (j = 0; j < avg; j++) {
-                laddr_list->entries[j].ipv4 = conf->lips[lip_id];
-                laddr_list->entries[j].port_id = i;
-                laddr_list->entries[j].rxq_id =
-                    dev->lcore_conf[lcore_id].rxq_id;
-                lip_id++;
-            }
-        }
-        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            if (lip_id == conf->nb_lips) {
-                break;
-            }
-
-            laddr_list = &dev->laddr_list[lcore_id];
-            laddr_list->nb += 1;
-            laddr_list->entries[j].ipv4 = conf->lips[lip_id];
-            laddr_list->entries[j].port_id = i;
-            laddr_list->entries[j].rxq_id = dev->lcore_conf[lcore_id].rxq_id;
-            lip_id++;
-        }
-
-        /* e) Initialize queue, kni, mp, txbuffer, ring. */
-        dev->type = LB_DEV_T_NORM;
-        rc = dpdk_device_init(port_id);
+        rc = init_laddr_list(dev, conf->lips, conf->nb_lips);
         if (rc < 0) {
-            RTE_LOG(ERR, USER1, "%s(): Initialize port%u failed.\n", __func__,
-                    port_id);
+            RTE_LOG(ERR, USER1, "%s(): init laddr list failed.\n", __func__);
             return rc;
         }
-    }
 
-    /* 2) Initialize bond device. */
-    for (i = 0; i < num; i++) {
+        rc = init_mempool(dev);
+        if (rc < 0) {
+            RTE_LOG(ERR, USER1, "%s(): init mempool failed.\n", __func__);
+            return rc;
+        }
+
+        rc = init_kni(dev);
+        if (rc < 0) {
+            RTE_LOG(ERR, USER1, "%s(): init kni failed.\n", __func__);
+            return rc;
+        }
+
+        rc = init_tx_buffer(dev);
+        if (rc < 0) {
+            RTE_LOG(ERR, USER1, "%s(): init tx buffer failed.\n", __func__);
+            return rc;
+        }
+
+        rc = init_master_worker_ring(dev);
+        if (rc < 0) {
+            RTE_LOG(ERR, USER1, "%s(): init master-worker ring failed.\n",
+                    __func__);
+            return rc;
+        }
+
+        rc = dpdk_dev_config_and_set_ipfilter(
+            dev->port_id, dev, dev->type == LB_DEV_T_NORM ? 1 : 0);
+        if (rc < 0) {
+            RTE_LOG(
+                ERR, USER1,
+                "%s(): config dpdk dev or add ip filter failed, port_id=%u.\n",
+                __func__, dev->port_id);
+            return rc;
+        }
+
+        for (j = 0; j < dev->nb_slaves; j++) {
+            rc = dpdk_dev_config_and_set_ipfilter(dev->slave_ports[j], dev, 1);
+            if (rc < 0) {
+                RTE_LOG(ERR, USER1,
+                        "%s(): config dpdk dev or add ip filter failed, "
+                        "port_id=%u.\n",
+                        __func__, dev->slave_ports[j]);
+                return rc;
+            }
+
+            rc = rte_eth_bond_slave_add(dev->port_id, dev->slave_ports[j]);
+            if (rc < 0) {
+                RTE_LOG(ERR, USER1,
+                        "%s(): add slave port%u to bond port%u failed.\n",
+                        __func__, dev->slave_ports[j], dev->port_id);
+                return rc;
+            }
+        }
+
+        rc = rte_eth_dev_start(dev->port_id);
+        if (rc < 0) {
+            RTE_LOG(ERR, USER1, "%s(): start port%u failed.\n", __func__,
+                    dev->port_id);
+            return rc;
+        }
     }
 
     return 0;
@@ -607,8 +775,8 @@ netdev_throughput_get(struct rte_eth_stats *stats, uint64_t throughput[]) {
 
 static void
 netdev_show_stats_cmd_cb(int fd, char *argv[], int argc) {
-    uint16_t nb_ports, port_id;
     int json_fmt, json_first_obj = 1;
+    uint16_t i;
     struct lb_device *dev;
     struct rte_eth_stats stats;
     uint32_t lcore_id;
@@ -626,18 +794,12 @@ netdev_show_stats_cmd_cb(int fd, char *argv[], int argc) {
     if (json_fmt)
         unixctl_command_reply(fd, "[");
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(i, dev) {
         tx_dropped = 0;
         rx_dropped = 0;
         memset(throughput, 0, sizeof(throughput));
 
-        rte_eth_stats_get(port_id, &stats);
+        rte_eth_stats_get(dev->port_id, &stats);
         RTE_LCORE_FOREACH(lcore_id) {
             tx_dropped += dev->lcore_stats[lcore_id].tx_dropped;
             rx_dropped += dev->lcore_stats[lcore_id].rx_dropped;
@@ -734,17 +896,11 @@ static void
 netdev_reset_stats_cmd_cb(__attribute__((unused)) int fd,
                           __attribute__((unused)) char *argv[],
                           __attribute__((unused)) int argc) {
-    uint32_t port_id, nb_ports;
+    uint16_t i;
     struct lb_device *dev;
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
-        rte_eth_stats_reset(port_id);
+    LB_DEVICE_FOREACH(i, dev) {
+        rte_eth_stats_reset(dev->port_id);
         memset(dev->lcore_stats, 0, sizeof(dev->lcore_stats));
     }
 }
@@ -755,35 +911,28 @@ UNIXCTL_CMD_REGISTER("netdev/reset", "", "Reset NIC packet statistics.", 0, 0,
 static void
 netdev_show_ipaddr_cmd_cb(int fd, __attribute__((unused)) char *argv[],
                           __attribute__((unused)) int argc) {
-    uint32_t port_id, nb_ports;
+    uint16_t devid;
     struct lb_device *dev;
     struct lb_laddr_list *laddr_list;
     struct lb_laddr *laddr;
-    char buf[32];
     uint32_t lcore_id;
     uint32_t i;
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(devid, dev) {
         unixctl_command_reply(fd, "dev: %s\n", dev->name);
-        ipv4_addr_tostring(dev->ipv4, buf, sizeof(buf));
-        unixctl_command_reply(fd, "  kni-ip: %s\n", buf);
-        ipv4_addr_tostring(dev->netmask, buf, sizeof(buf));
-        unixctl_command_reply(fd, "  kni-netmask: %s\n", buf);
-        ipv4_addr_tostring(dev->gw, buf, sizeof(buf));
-        unixctl_command_reply(fd, "  kni-gw: %s\n", buf);
+        unixctl_command_reply(fd, "  kni-ip: " IPv4_BE_FMT "\n",
+                              IPv4_BE_ARG(dev->ipv4));
+        unixctl_command_reply(fd, "  kni-netmask: " IPv4_BE_FMT "\n",
+                              IPv4_BE_ARG(dev->ipv4));
+        unixctl_command_reply(fd, "  kni-gw: " IPv4_BE_FMT "\n",
+                              IPv4_BE_ARG(dev->ipv4));
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
             laddr_list = &dev->laddr_list[lcore_id];
             for (i = 0; i < laddr_list->nb; i++) {
                 laddr = &laddr_list->entries[i];
-                ipv4_addr_tostring(laddr->ipv4, buf, sizeof(buf));
-                unixctl_command_reply(fd, "  local-ip[c%uq%u]: %s\n", lcore_id,
-                                      laddr->rxq_id, buf);
+                unixctl_command_reply(
+                    fd, "  local-ip[c%uq%u]: " IPv4_BE_FMT "\n", lcore_id,
+                    laddr->rxq_id, IPv4_BE_ARG(laddr->ipv4));
             }
         }
     }
@@ -795,18 +944,12 @@ UNIXCTL_CMD_REGISTER("netdev/ipaddr", "", "Show KNI/LOCAL ipv4 address.", 0, 0,
 static void
 netdev_show_hwinfo_cmd_cb(int fd, __attribute__((unused)) char *argv[],
                           __attribute__((unused)) int argc) {
-    uint32_t port_id, nb_ports;
+    uint16_t i;
     struct lb_device *dev;
     char mac[32];
     struct rte_eth_link link_params;
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(i, dev) {
         unixctl_command_reply(fd, "dev: %s\n", dev->name);
         mac_addr_tostring(&dev->ha, mac, sizeof(mac));
         unixctl_command_reply(fd, "  hw: %s\n", mac);
@@ -961,19 +1104,15 @@ netdev_show_fdir_cmd_cb(int fd, __attribute__((unused)) char *argv[],
                         __attribute__((unused)) int argc) {
     struct rte_eth_fdir_stats fdir_stat;
     struct rte_eth_fdir_info fdir_info;
-    uint16_t nb_ports, port_id;
+    uint16_t port_id;
+    uint16_t i;
     struct lb_device *dev;
     int ret;
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
+    LB_DEVICE_FOREACH(i, dev) {
         static const char *fdir_stats_border = "########################";
 
+        port_id = dev->port_id;
         ret = rte_eth_dev_filter_supported(port_id, RTE_ETH_FILTER_FDIR);
         if (ret < 0) {
             unixctl_command_reply(fd, "\n FDIR is not supported on port %-2d\n",
@@ -1070,7 +1209,7 @@ static void
 laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
     int json_fmt = 0, json_first_obj = 1;
     int rc;
-    uint16_t nb_ports, port_id;
+    uint16_t devid;
     struct lb_device *dev;
     uint32_t lcore_id;
     struct lb_laddr_list *laddr_list;
@@ -1086,15 +1225,9 @@ laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
     if (json_fmt)
         unixctl_command_reply(fd, "[");
 
-    nb_ports = rte_eth_dev_count();
-    for (port_id = 0; port_id < nb_ports; port_id++) {
+    LB_DEVICE_FOREACH(devid, dev) {
         uint32_t total_lports[LB_IPPROTO_MAX] = {0},
                  avail_lports[LB_IPPROTO_MAX] = {0};
-
-        dev = &lb_devices[port_id];
-        if (dev->type != LB_DEV_T_NORM && dev->type != LB_DEV_T_MASTER) {
-            continue;
-        }
 
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
             laddr_list = &dev->laddr_list[lcore_id];

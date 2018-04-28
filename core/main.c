@@ -96,15 +96,13 @@ unixctl_server_init(const char *path) {
 }
 
 static void
-handle_packets(struct rte_mbuf **pkts, uint16_t n, uint16_t port_id) {
+handle_packets(struct rte_mbuf **pkts, uint16_t n, struct lb_device *dev) {
     uint16_t i;
-    struct lb_device *dev;
     struct rte_mbuf *m;
     struct ether_hdr *eth;
     struct ipv4_hdr *iph;
     struct lb_proto *p;
 
-    dev = &lb_devices[port_id];
     for (i = 0; i < n; i++) {
         m = pkts[i];
 
@@ -124,7 +122,7 @@ handle_packets(struct rte_mbuf **pkts, uint16_t n, uint16_t port_id) {
             } else {
                 p = lb_proto_get(iph->next_proto_id);
                 if (p != NULL) {
-                    p->fullnat_handle(m, iph, port_id);
+                    p->fullnat_handle(m, iph, dev);
                 } else {
                     rte_pktmbuf_free(m);
                 }
@@ -135,34 +133,11 @@ handle_packets(struct rte_mbuf **pkts, uint16_t n, uint16_t port_id) {
         }
     }
 }
-/*
-#include <rte_tcp.h>
-
-#define IPV4_HLEN(iph) (((iph)->version_ihl & IPV4_HDR_IHL_MASK) << 2)
-#define TCP_HDR(iph) (struct tcp_hdr *)((char *)(iph) + IPV4_HLEN(iph))
-
-static int
-drop_ack(struct rte_mbuf *m)
-{
-        struct ether_hdr *eth;
-        struct ipv4_hdr *iph;
-        struct tcp_hdr *th;
-
-        eth = rte_pktmbuf_mtod_offset(m, struct ether_hdr *, 0);
-        if (eth->ether_type != rte_be_to_cpu_16(0x0800))
-                return 0;
-        iph = rte_pktmbuf_mtod_offset(m, struct ipv4_hdr *, ETHER_HDR_LEN);
-        if (iph->next_proto_id != IPPROTO_TCP)
-                return 0;
-        th = TCP_HDR(iph);
-        if (th->tcp_flags & TCP_ACK_FLAG && !(th->tcp_flags & TCP_SYN_FLAG) &&
-!(th->tcp_flags & TCP_FIN_FLAG)) return 1; return 0;
-}*/
 
 static int
 master_loop(__attribute__((unused)) void *arg) {
     uint32_t lcore_id;
-    uint16_t i, j, nb_ports;
+    uint16_t i, j;
     uint16_t nb_ctx;
     struct {
         uint16_t port_id;
@@ -170,26 +145,23 @@ master_loop(__attribute__((unused)) void *arg) {
         struct rte_eth_dev_tx_buffer *tx_buffer;
         struct rte_kni *kni;
         struct rte_ring *ring;
+        struct lb_device *dev;
     } ctx[RTE_MAX_ETHPORTS];
+    uint16_t devid;
+    struct lb_device *dev;
     struct rte_mbuf *pkts[PKT_MAX_BURST];
     uint32_t n, nb_tx;
     struct ether_hdr *ethh;
 
     lcore_id = rte_lcore_id();
     nb_ctx = 0;
-    nb_ports = rte_eth_dev_count();
-    for (i = 0; i < nb_ports; i++) {
-        if (lb_devices[i].type != LB_DEV_T_NORM &&
-            lb_devices[i].type != LB_DEV_T_MASTER) {
-            continue;
-        }
-
-        ctx[nb_ctx].port_id = i;
-        ctx[nb_ctx].txq_id = lb_devices[i].lcore_conf[lcore_id].txq_id;
-        ctx[nb_ctx].tx_buffer = lb_devices[i].tx_buffer[lcore_id];
-        ctx[nb_ctx].kni = lb_devices[i].kni;
-        ctx[nb_ctx].ring = lb_devices[i].ring;
-
+    LB_DEVICE_FOREACH(devid, dev) {
+        ctx[nb_ctx].port_id = dev->port_id;
+        ctx[nb_ctx].txq_id = dev->lcore_conf[lcore_id].txq_id;
+        ctx[nb_ctx].tx_buffer = dev->tx_buffer[lcore_id];
+        ctx[nb_ctx].kni = dev->kni;
+        ctx[nb_ctx].ring = dev->ring;
+        ctx[nb_ctx].dev = dev;
         nb_ctx++;
     }
 
@@ -218,7 +190,7 @@ master_loop(__attribute__((unused)) void *arg) {
             for (j = 0; j < n; j++) {
                 ethh = rte_pktmbuf_mtod_offset(pkts[j], struct ether_hdr *, 0);
                 if (ethh->ether_type == rte_be_to_cpu_16(ETHER_TYPE_ARP)) {
-                    lb_arp_input(pkts[j], ctx[i].port_id);
+                    lb_arp_input(pkts[j], ctx[i].dev);
                 }
             }
             nb_tx = rte_kni_tx_burst(ctx[i].kni, pkts, n);
@@ -236,30 +208,29 @@ master_loop(__attribute__((unused)) void *arg) {
 static int
 worker_loop(__attribute__((unused)) void *arg) {
     uint32_t lcore_id;
-    uint16_t i, nb_ports;
+    uint16_t i;
     uint16_t nb_ctx;
     struct {
         uint16_t port_id;
         uint16_t rxq_id, txq_id;
+        struct lb_device *dev;
         struct rte_eth_dev_tx_buffer *tx_buffer;
         struct rte_mbuf *rx_pkts[PKT_MAX_BURST];
         uint32_t n;
     } ctx[RTE_MAX_ETHPORTS];
+    uint16_t devid;
+    struct lb_device *dev;
 
     lcore_id = rte_lcore_id();
     nb_ctx = 0;
-    nb_ports = rte_eth_dev_count();
-    for (i = 0; i < nb_ports; i++) {
-        if (lb_devices[i].type != LB_DEV_T_NORM &&
-            lb_devices[i].type != LB_DEV_T_MASTER) {
+    LB_DEVICE_FOREACH(devid, dev) {
+        if (!dev->lcore_conf[lcore_id].rxq_enable)
             continue;
-        }
-
-        ctx[nb_ctx].port_id = i;
-        ctx[nb_ctx].rxq_id = lb_devices[i].lcore_conf[lcore_id].rxq_id;
-        ctx[nb_ctx].txq_id = lb_devices[i].lcore_conf[lcore_id].txq_id;
-        ctx[nb_ctx].tx_buffer = lb_devices[i].tx_buffer[lcore_id];
-
+        ctx[nb_ctx].port_id = dev->port_id;
+        ctx[nb_ctx].rxq_id = dev->lcore_conf[lcore_id].rxq_id;
+        ctx[nb_ctx].txq_id = dev->lcore_conf[lcore_id].txq_id;
+        ctx[nb_ctx].tx_buffer = dev->tx_buffer[lcore_id];
+        ctx[nb_ctx].dev = dev;
         nb_ctx++;
     }
 
@@ -284,7 +255,7 @@ worker_loop(__attribute__((unused)) void *arg) {
         }
 
         for (i = 0; i < nb_ctx; i++) {
-            handle_packets(ctx[i].rx_pkts, ctx[i].n, ctx[i].port_id);
+            handle_packets(ctx[i].rx_pkts, ctx[i].n, ctx[i].dev);
         }
 
         RUN_ONCE_N_MS(rte_timer_manage, 1);
@@ -522,9 +493,9 @@ memory_cmd_cb(int fd, char *argv[], int argc) {
                                   (uint64_t)sock_stats.heap_freesz_bytes);
             unixctl_command_reply(fd, NORM_KV_64_FMT("  Alloc_size", "\n"),
                                   (uint64_t)sock_stats.heap_allocsz_bytes);
-            unixctl_command_reply(
-                fd, NORM_KV_64_FMT("  Greatest_free_size", "\n"),
-                (uint64_t)sock_stats.greatest_free_size);
+            unixctl_command_reply(fd,
+                                  NORM_KV_64_FMT("  Greatest_free_size", "\n"),
+                                  (uint64_t)sock_stats.greatest_free_size);
             unixctl_command_reply(fd, NORM_KV_32_FMT("  Alloc_count", "\n"),
                                   (uint32_t)sock_stats.alloc_count);
             unixctl_command_reply(fd, NORM_KV_32_FMT("  Free_count", "\n"),
@@ -554,4 +525,3 @@ memory_cmd_cb(int fd, char *argv[], int argc) {
 
 UNIXCTL_CMD_REGISTER("memory", "[--json].", "Show memory information.", 0, 1,
                      memory_cmd_cb);
-

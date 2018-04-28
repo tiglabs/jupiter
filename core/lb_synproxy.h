@@ -9,6 +9,7 @@
 
 struct lb_conn;
 struct lb_conn_table;
+struct lb_device;
 
 /* Add MASKs for TCP OPT in "data" coded in cookie */
 /* |[21][20][19-16][15-0]|
@@ -57,14 +58,13 @@ uint32_t synproxy_cookie_ipv4_check(struct ipv4_hdr *iph, struct tcp_hdr *th,
                                     struct synproxy_options *opts);
 int synproxy_recv_backend_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
                                  struct tcp_hdr *th, struct lb_conn *conn,
-                                 uint16_t port_id);
+                                 struct lb_device *dev);
 int synproxy_recv_client_ack(struct rte_mbuf *m, struct ipv4_hdr *iph,
                              struct tcp_hdr *th, struct lb_conn_table *ct,
-                             uint16_t port_id);
+                             struct lb_device *dev);
 int synproxy_recv_client_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
-                             struct tcp_hdr *th, uint16_t port_id);
+                             struct tcp_hdr *th, struct lb_device *dev);
 void synproxy_seq_adjust_client(struct tcp_hdr *th, struct synproxy *proxy);
 void synproxy_seq_adjust_backend(struct tcp_hdr *th, struct synproxy *proxy);
 
 #endif
-

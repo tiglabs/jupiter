@@ -59,14 +59,14 @@ udp_conn_timer_expire_cb(struct lb_conn *conn, uint32_t ctime) {
 
 static struct lb_conn *
 udp_conn_schedule(struct lb_conn_table *ct, struct ipv4_hdr *iph,
-                  struct udp_hdr *uh, uint16_t port_id) {
+                  struct udp_hdr *uh, struct lb_device *dev) {
     struct lb_virt_service *vs = NULL;
     struct lb_real_service *rs = NULL;
     struct lb_conn *conn = NULL;
 
     if ((vs = lb_vs_get(iph->dst_addr, uh->dst_port, iph->next_proto_id)) &&
         (rs = lb_vs_get_rs(vs, iph->src_addr, uh->src_port)) &&
-        (conn = lb_conn_new(ct, iph->src_addr, uh->src_port, rs, 0, port_id))) {
+        (conn = lb_conn_new(ct, iph->src_addr, uh->src_port, rs, 0, dev))) {
         lb_vs_put(vs);
         return conn;
     }
@@ -83,14 +83,14 @@ udp_conn_schedule(struct lb_conn_table *ct, struct ipv4_hdr *iph,
 static int
 udp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
                         struct udp_hdr *uh, struct lb_conn_table *ct,
-                        struct lb_conn *conn, uint16_t port_id) {
+                        struct lb_conn *conn, struct lb_device *dev) {
     if (conn != NULL) {
         lb_conn_expire(ct, conn);
         conn = NULL;
     }
 
     if (conn == NULL) {
-        conn = udp_conn_schedule(ct, iph, uh, port_id);
+        conn = udp_conn_schedule(ct, iph, uh, dev);
         if (conn == NULL) {
             rte_pktmbuf_free(m);
             return 0;
@@ -112,13 +112,13 @@ udp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
         uh->dgram_cksum = rte_ipv4_udptcp_cksum(iph, uh);
     }
 
-    return lb_device_output(m, iph, port_id);
+    return lb_device_output(m, iph, dev);
 }
 
 static int
 udp_fullnat_recv_backend(struct rte_mbuf *m, struct ipv4_hdr *iph,
                          struct udp_hdr *uh, struct lb_conn *conn,
-                         uint16_t port_id) {
+                         struct lb_device *dev) {
     udp_set_conntrack_state(conn, uh, LB_DIR_REPLY);
     udp_set_packet_stats(conn, m, LB_DIR_REPLY);
 
@@ -134,11 +134,12 @@ udp_fullnat_recv_backend(struct rte_mbuf *m, struct ipv4_hdr *iph,
         uh->dgram_cksum = rte_ipv4_udptcp_cksum(iph, uh);
     }
 
-    return lb_device_output(m, iph, port_id);
+    return lb_device_output(m, iph, dev);
 }
 
 static int
-udp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
+udp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph,
+                   struct lb_device *dev) {
     struct lb_conn_table *ct;
     struct lb_conn *conn;
     struct udp_hdr *uh;
@@ -151,9 +152,9 @@ udp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
     conn = lb_conn_find(ct, iph->src_addr, iph->dst_addr, uh->src_port,
                         uh->dst_port, &dir);
     if (dir == LB_DIR_REPLY)
-        rc = udp_fullnat_recv_backend(m, iph, uh, conn, port_id);
+        rc = udp_fullnat_recv_backend(m, iph, uh, conn, dev);
     else
-        rc = udp_fullnat_recv_client(m, iph, uh, ct, conn, port_id);
+        rc = udp_fullnat_recv_client(m, iph, uh, ct, conn, dev);
 
     return rc;
 }
@@ -219,4 +220,3 @@ udp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
 
 UNIXCTL_CMD_REGISTER("udp/conn/dump", "", "Dump UDP connections.", 0, 0,
                      udp_conn_dump_cmd_cb);
-

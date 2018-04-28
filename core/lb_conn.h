@@ -88,7 +88,7 @@ struct lb_conn_table {
 
 struct lb_conn *lb_conn_new(struct lb_conn_table *ct, uint32_t cip,
                             uint32_t cport, struct lb_real_service *rs,
-                            uint8_t is_synproxy, uint16_t port_id);
+                            uint8_t is_synproxy, struct lb_device *dev);
 void lb_conn_expire(struct lb_conn_table *ct, struct lb_conn *conn);
 struct lb_conn *lb_conn_find(struct lb_conn_table *ct, uint32_t sip,
                              uint32_t dip, uint16_t sport, uint16_t dport,
@@ -99,4 +99,3 @@ int lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
                        int (*expire_cb)(struct lb_conn *, uint32_t));
 
 #endif
-

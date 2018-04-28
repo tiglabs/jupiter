@@ -273,7 +273,7 @@ synproxy_seq_adjust_backend(struct tcp_hdr *th, struct synproxy *proxy) {
 
 static void
 synproxy_sent_client_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
-                            struct tcp_hdr *th, uint16_t port_id) {
+                            struct tcp_hdr *th, struct lb_device *dev) {
     struct synproxy_options opts;
     uint32_t isn;
     uint16_t pkt_len;
@@ -305,12 +305,12 @@ synproxy_sent_client_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 int
 synproxy_recv_client_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
-                         struct tcp_hdr *th, uint16_t port_id) {
+                         struct tcp_hdr *th, struct lb_device *dev) {
     struct lb_virt_service *vs = NULL;
 
     if (SYN(th) && !ACK(th) && !RST(th) && !FIN(th) &&
@@ -320,7 +320,7 @@ synproxy_recv_client_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
             /* Reject connect. */
             rte_pktmbuf_free(m);
         else
-            synproxy_sent_client_synack(m, iph, th, port_id);
+            synproxy_sent_client_synack(m, iph, th, dev);
         lb_vs_put(vs);
         return 0;
     } else {
@@ -356,7 +356,8 @@ synproxy_syn_build_options(uint32_t *ptr, struct synproxy_options *opts) {
 static void
 synproxy_sent_backend_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
                           struct tcp_hdr *th, struct lb_conn *conn,
-                          struct synproxy_options *opts, uint16_t port_id) {
+                          struct synproxy_options *opts,
+                          struct lb_device *dev) {
     struct tcp_hdr *nth;
     uint16_t win;
     uint16_t tcphdr_size;
@@ -396,18 +397,17 @@ synproxy_sent_backend_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
 
     mcopy = rte_pktmbuf_clone(m, m->pool);
     if (mcopy != NULL) {
-        /* Fix m->port for BOND dev. */
-        mcopy->port = port_id;
+        mcopy->userdata = dev;
         conn->proxy.syn_mbuf = mcopy;
     }
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 int
 synproxy_recv_client_ack(struct rte_mbuf *m, struct ipv4_hdr *iph,
                          struct tcp_hdr *th, struct lb_conn_table *ct,
-                         uint16_t port_id) {
+                         struct lb_device *dev) {
     struct synproxy_options opts;
     struct lb_virt_service *vs = NULL;
     struct lb_real_service *rs = NULL;
@@ -418,13 +418,12 @@ synproxy_recv_client_ack(struct rte_mbuf *m, struct ipv4_hdr *iph,
         (vs->flags & LB_VS_F_SYNPROXY)) {
         if (synproxy_cookie_ipv4_check(iph, th, &opts) &&
             (rs = lb_vs_get_rs(vs, iph->src_addr, th->src_port)) &&
-            (conn = lb_conn_new(ct, iph->src_addr, th->src_port, rs, 1,
-                                port_id))) {
+            (conn = lb_conn_new(ct, iph->src_addr, th->src_port, rs, 1, dev))) {
             tcp_conn_set_state(conn, TCP_CONNTRACK_SYN_SENT);
 
             conn->proxy.isn = rte_be_to_cpu_32(th->recv_ack) - 1;
 
-            synproxy_sent_backend_syn(m, iph, th, conn, &opts, port_id);
+            synproxy_sent_backend_syn(m, iph, th, conn, &opts, dev);
         } else {
             rte_pktmbuf_free(m);
         }
@@ -442,7 +441,7 @@ synproxy_recv_client_ack(struct rte_mbuf *m, struct ipv4_hdr *iph,
 
 static void
 synproxy_sent_ack_to_backend(struct rte_mbuf *m, struct lb_conn *conn,
-                             uint16_t port_id) {
+                             struct lb_device *dev) {
     struct ipv4_hdr *iph;
     struct tcp_hdr *th;
 
@@ -461,13 +460,13 @@ synproxy_sent_ack_to_backend(struct rte_mbuf *m, struct lb_conn *conn,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 static void
 synproxy_fwd_synack_to_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
                               struct tcp_hdr *th, struct lb_conn *conn,
-                              uint16_t port_id) {
+                              struct lb_device *dev) {
     iph->src_addr = conn->vip;
     iph->dst_addr = conn->cip;
     th->src_port = conn->vport;
@@ -479,13 +478,13 @@ synproxy_fwd_synack_to_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 static void
 synproxy_fwd_rst_to_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
                            struct tcp_hdr *th, struct lb_conn *conn,
-                           uint16_t port_id) {
+                           struct lb_device *dev) {
     iph->src_addr = conn->vip;
     iph->dst_addr = conn->cip;
     th->src_port = conn->vport;
@@ -498,13 +497,13 @@ synproxy_fwd_rst_to_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
     th->cksum = 0;
     th->cksum = rte_ipv4_udptcp_cksum(iph, th);
 
-    lb_device_output(m, iph, port_id);
+    lb_device_output(m, iph, dev);
 }
 
 int
 synproxy_recv_backend_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
                              struct tcp_hdr *th, struct lb_conn *conn,
-                             uint16_t port_id) {
+                             struct lb_device *dev) {
     if (SYN(th) && ACK(th) && !RST(th) && !FIN(th) &&
         (conn->flags & LB_CONN_F_SYNPROXY) &&
         (conn->state == TCP_CONNTRACK_SYN_SENT)) {
@@ -519,13 +518,13 @@ synproxy_recv_backend_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
 
             /* Free SYNACK, and send ACK to backend. */
             rte_pktmbuf_free(m);
-            synproxy_sent_ack_to_backend(conn->proxy.ack_mbuf, conn, port_id);
+            synproxy_sent_ack_to_backend(conn->proxy.ack_mbuf, conn, dev);
             conn->proxy.ack_mbuf = NULL;
         } else {
             tcp_conn_set_state(conn, TCP_CONNTRACK_SYN_RECV);
 
             /* FWD SYNACK to client. */
-            synproxy_fwd_synack_to_client(m, iph, th, conn, port_id);
+            synproxy_fwd_synack_to_client(m, iph, th, conn, dev);
         }
         return 0;
     } else if (RST(th) && (conn->flags & LB_CONN_F_SYNPROXY) &&
@@ -533,9 +532,8 @@ synproxy_recv_backend_synack(struct rte_mbuf *m, struct ipv4_hdr *iph,
         tcp_conn_set_state(conn, TCP_CONNTRACK_CLOSE);
 
         /* FWD RST to client. */
-        synproxy_fwd_rst_to_client(m, iph, th, conn, port_id);
+        synproxy_fwd_rst_to_client(m, iph, th, conn, dev);
         return 0;
     }
     return 1;
 }
-

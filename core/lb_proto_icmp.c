@@ -21,7 +21,7 @@ icmp_cksum(const struct ipv4_hdr *iph, const struct icmp_hdr *icmph) {
 
 static int
 icmp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph,
-                    uint16_t port_id) {
+                    struct lb_device *dev) {
     struct icmp_hdr *icmph;
     uint32_t tmpaddr;
 
@@ -31,7 +31,7 @@ icmp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph,
     }
 
     if (!lb_is_vip_exist(iph->dst_addr) &&
-        !lb_is_laddr_exist(iph->dst_addr, port_id)) {
+        !lb_is_laddr_exist(iph->dst_addr, dev)) {
         rte_pktmbuf_free(m);
         return 0;
     }
@@ -53,7 +53,7 @@ icmp_fullnat_handle(struct rte_mbuf *m, struct ipv4_hdr *iph,
     icmph->icmp_cksum = 0;
     icmph->icmp_cksum = icmp_cksum(iph, icmph);
 
-    return lb_device_output(m, iph, port_id);
+    return lb_device_output(m, iph, dev);
 }
 
 static int
@@ -69,4 +69,3 @@ static struct lb_proto proto_icmp = {
 };
 
 LB_PROTO_REGISTER(proto_icmp);
-

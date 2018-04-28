@@ -23,7 +23,8 @@
 
 struct lb_conn *
 lb_conn_new(struct lb_conn_table *ct, uint32_t cip, uint32_t cport,
-            struct lb_real_service *rs, uint8_t is_synproxy, uint16_t port_id) {
+            struct lb_real_service *rs, uint8_t is_synproxy,
+            struct lb_device *dev) {
     struct lb_conn *conn;
     struct ipv4_4tuple tuple;
     int rc;
@@ -33,7 +34,7 @@ lb_conn_new(struct lb_conn_table *ct, uint32_t cip, uint32_t cport,
         return NULL;
     }
 
-    rc = lb_laddr_get(port_id, ct->type, &conn->laddr, &conn->lport);
+    rc = lb_laddr_get(dev, ct->type, &conn->laddr, &conn->lport);
     if (rc < 0) {
         rte_mempool_put(ct->mp, conn);
         return NULL;
@@ -220,4 +221,3 @@ lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
 
     return 0;
 }
-

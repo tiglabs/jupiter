@@ -23,11 +23,14 @@ enum {
     LB_DIR_MAX,
 };
 
+struct lb_device;
+
 struct lb_proto {
     uint8_t id;
     enum lb_proto_type type;
     int (*init)(void);
-    int (*fullnat_handle)(struct rte_mbuf *, struct ipv4_hdr *, uint16_t);
+    int (*fullnat_handle)(struct rte_mbuf *, struct ipv4_hdr *,
+                          struct lb_device *dev);
 };
 
 #define IPv4_HLEN(iph) (((iph)->version_ihl & IPV4_HDR_IHL_MASK) << 2)
@@ -108,4 +111,3 @@ lb_proto_get(uint8_t id) {
 int lb_proto_init(void);
 
 #endif
-

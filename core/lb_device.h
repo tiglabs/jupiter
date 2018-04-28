@@ -11,8 +11,8 @@
 #include <rte_ring.h>
 
 #include "lb_arp.h"
-#include "lb_proto.h"
 #include "lb_config.h"
+#include "lb_proto.h"
 
 #define PKT_MAX_BURST 32
 
@@ -21,8 +21,7 @@
 
 enum {
     LB_DEV_T_NORM = 0, /* Normal port. */
-    LB_DEV_T_MASTER,   /* Master bond port. */
-    LB_DEV_T_SLAVE,    /* Slave bond port. */
+    LB_DEV_T_BOND,     /* Bond port. */
 };
 
 struct lb_laddr {
@@ -40,8 +39,8 @@ struct lb_laddr_list {
 struct lb_device {
     uint16_t type;
 
-    /* Master bond port. */
-    uint16_t master;
+    uint32_t port_id;
+    uint32_t socket_id;
 
     struct ether_addr ha;
     uint16_t mtu;
@@ -79,17 +78,24 @@ struct lb_device {
     struct rte_ring *ring;
 
     struct lb_laddr_list laddr_list[RTE_MAX_LCORE];
+
+    uint32_t nb_slaves;
+    uint32_t slave_ports[RTE_MAX_ETHPORTS];
 };
 
-extern struct lb_device lb_devices[RTE_MAX_ETHPORTS];
+extern struct lb_device *lb_devices[RTE_MAX_ETHPORTS];
+extern uint16_t lb_device_count;
+
+#define LB_DEVICE_FOREACH(i, dev)                                              \
+    for (i = 0; (dev = lb_devices[i]) != NULL; i++)
 
 static inline int
-lb_is_laddr_exist(uint32_t lip, uint16_t port_id) {
+lb_is_laddr_exist(uint32_t lip, struct lb_device *dev) {
     struct lb_laddr_list *list;
     uint32_t lcore_id = rte_lcore_id();
     uint32_t i;
 
-    list = &lb_devices[port_id].laddr_list[lcore_id];
+    list = &dev->laddr_list[lcore_id];
     for (i = 0; i < list->nb; i++) {
         if (lip == list->entries[i].ipv4)
             return 1;
@@ -98,16 +104,14 @@ lb_is_laddr_exist(uint32_t lip, uint16_t port_id) {
 }
 
 static inline int
-lb_laddr_get(uint16_t port_id, enum lb_proto_type type, struct lb_laddr **laddr,
-             uint16_t *port) {
-    struct lb_device *dev;
+lb_laddr_get(struct lb_device *dev, enum lb_proto_type type,
+             struct lb_laddr **laddr, uint16_t *port) {
     struct lb_laddr_list *list;
     struct lb_laddr *addr;
     void *p = NULL;
     uint32_t lcore_id, i;
 
     lcore_id = rte_lcore_id();
-    dev = &lb_devices[port_id];
     list = &dev->laddr_list[lcore_id];
 
     for (i = 0; i < list->nb; i++) {
@@ -130,8 +134,8 @@ lb_laddr_put(struct lb_laddr *laddr, uint16_t port, enum lb_proto_type type) {
     ((addr1 & netmask) == (addr2 & netmask))
 
 static inline int
-lb_device_dst_mac_find(uint32_t dip, struct ether_addr *ea, uint16_t port_id) {
-    struct lb_device *dev = &lb_devices[port_id];
+lb_device_dst_mac_find(uint32_t dip, struct ether_addr *ea,
+                       struct lb_device *dev) {
     uint32_t rip;
     int rc;
 
@@ -141,27 +145,35 @@ lb_device_dst_mac_find(uint32_t dip, struct ether_addr *ea, uint16_t port_id) {
         rip = dev->gw;
     }
 
-    rc = lb_arp_find(rip, ea, port_id);
+    rc = lb_arp_find(rip, ea, dev);
     if (rc < 0) {
-        lb_arp_request(rip, port_id);
+        lb_arp_request(rip, dev);
     }
 
     return rc;
 }
 
-static inline int
-lb_device_output(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
-    struct lb_device *dev;
-    struct ether_hdr *eth;
+static inline void
+lb_device_tx_mbuf(struct rte_mbuf *m, struct lb_device *dev) {
     uint32_t lcore_id;
     uint16_t txq_id;
     struct rte_eth_dev_tx_buffer *tx_buffer;
+
+    lcore_id = rte_lcore_id();
+    txq_id = dev->lcore_conf[lcore_id].txq_id;
+    tx_buffer = dev->tx_buffer[lcore_id];
+    rte_eth_tx_buffer(dev->port_id, txq_id, tx_buffer, m);
+}
+
+static inline int
+lb_device_output(struct rte_mbuf *m, struct ipv4_hdr *iph,
+                 struct lb_device *dev) {
+    struct ether_hdr *eth;
     int rc;
 
-    dev = &lb_devices[port_id];
     eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
 
-    rc = lb_device_dst_mac_find(iph->dst_addr, &eth->d_addr, port_id);
+    rc = lb_device_dst_mac_find(iph->dst_addr, &eth->d_addr, dev);
     if (rc < 0) {
         rte_pktmbuf_free(m);
         return rc;
@@ -169,31 +181,20 @@ lb_device_output(struct rte_mbuf *m, struct ipv4_hdr *iph, uint16_t port_id) {
     ether_addr_copy(&dev->ha, &eth->s_addr);
     eth->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
 
-    lcore_id = rte_lcore_id();
-    txq_id = dev->lcore_conf[lcore_id].txq_id;
-    tx_buffer = dev->tx_buffer[lcore_id];
-    rte_eth_tx_buffer(port_id, txq_id, tx_buffer, m);
-
+    lb_device_tx_mbuf(m, dev);
     return 0;
 }
 
 static inline struct rte_mbuf *
-lb_device_pktmbuf_alloc(uint16_t port_id) {
-    struct lb_device *dev;
-
-    dev = &lb_devices[port_id];
+lb_device_pktmbuf_alloc(struct lb_device *dev) {
     return rte_pktmbuf_alloc(dev->mp);
 }
 
 static inline struct rte_mbuf *
-lb_device_pktmbuf_clone(struct rte_mbuf *m, uint16_t port_id) {
-    struct lb_device *dev;
-
-    dev = &lb_devices[port_id];
+lb_device_pktmbuf_clone(struct rte_mbuf *m, struct lb_device *dev) {
     return rte_pktmbuf_clone(m, dev->mp);
 }
 
 int lb_device_init(struct lb_device_conf *configs, uint16_t num);
 
 #endif /* __LB_DEVICE_H__ */
-
