@@ -41,6 +41,7 @@ lb_conn_new(struct lb_conn_table *ct, uint32_t cip, uint32_t cport,
     }
 
     conn->ct = ct;
+    conn->dev = dev;
     conn->lip = conn->laddr->ipv4;
     conn->cip = cip;
     conn->cport = cport;

@@ -341,7 +341,7 @@ tcp_conn_timer_task_cb(struct lb_conn *conn) {
             if (mcopy != NULL) {
                 iph = rte_pktmbuf_mtod_offset(mcopy, struct ipv4_hdr *,
                                               ETHER_HDR_LEN);
-                lb_device_output(mcopy, iph, mcopy->userdata);
+                lb_device_output(mcopy, iph, conn->dev);
             }
         }
     }

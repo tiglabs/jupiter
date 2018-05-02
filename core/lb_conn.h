@@ -39,6 +39,7 @@ struct lb_conn {
     TAILQ_ENTRY(lb_conn) next;
 
     struct lb_conn_table *ct;
+    struct lb_device *dev;
 
     uint32_t cip, vip, lip, rip;
     uint16_t cport, vport, lport, rport;

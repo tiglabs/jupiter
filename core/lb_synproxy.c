@@ -361,7 +361,6 @@ synproxy_sent_backend_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
     struct tcp_hdr *nth;
     uint16_t win;
     uint16_t tcphdr_size;
-    struct rte_mbuf *mcopy;
 
     /* For tcp seq adjust. */
     tcp_secret_seq_init(conn->lip, conn->rip, conn->lport, conn->rport,
@@ -395,11 +394,7 @@ synproxy_sent_backend_syn(struct rte_mbuf *m, struct ipv4_hdr *iph,
     nth->cksum = 0;
     nth->cksum = rte_ipv4_udptcp_cksum(iph, nth);
 
-    mcopy = rte_pktmbuf_clone(m, m->pool);
-    if (mcopy != NULL) {
-        mcopy->userdata = dev;
-        conn->proxy.syn_mbuf = mcopy;
-    }
+    conn->proxy.syn_mbuf = rte_pktmbuf_clone(m, m->pool);
 
     lb_device_output(m, iph, dev);
 }
