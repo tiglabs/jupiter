@@ -1,6 +1,7 @@
 /* Copyright (c) 2018. TIG developer. */
 
 #include <rte_ip.h>
+#include <rte_mempool.h>
 #include <rte_udp.h>
 
 #include <unixctl_command.h>
@@ -220,3 +221,66 @@ udp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
 
 UNIXCTL_CMD_REGISTER("udp/conn/dump", "", "Dump UDP connections.", 0, 0,
                      udp_conn_dump_cmd_cb);
+
+static void
+udp_conn_stats_normal(int fd) {
+    uint32_t lcore_id;
+    struct lb_conn_table *ct;
+
+    unixctl_command_reply(fd, "             ");
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        unixctl_command_reply(fd, "lcore%-5u  ", lcore_id);
+    }
+    unixctl_command_reply(fd, "\n");
+
+    unixctl_command_reply(fd, "avail_conns  ");
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        ct = &lb_conn_tbls[lcore_id];
+        unixctl_command_reply(fd, "%-10u  ", rte_mempool_avail_count(ct->mp));
+    }
+    unixctl_command_reply(fd, "\n");
+
+    unixctl_command_reply(fd, "inuse_conns  ");
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        ct = &lb_conn_tbls[lcore_id];
+        unixctl_command_reply(fd, "%-10u  ", rte_mempool_in_use_count(ct->mp));
+    }
+    unixctl_command_reply(fd, "\n");
+}
+
+static void
+udp_conn_stats_json(int fd) {
+    uint32_t lcore_id;
+    struct lb_conn_table *ct;
+    uint8_t json_first_obj = 1;
+
+    unixctl_command_reply(fd, "[");
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        ct = &lb_conn_tbls[lcore_id];
+        if (json_first_obj) {
+            json_first_obj = 0;
+            unixctl_command_reply(fd, "{");
+        } else {
+            unixctl_command_reply(fd, ",{");
+        }
+        unixctl_command_reply(fd, JSON_KV_32_FMT("lcore", ","), lcore_id);
+        unixctl_command_reply(fd, JSON_KV_32_FMT("avail_conns", ","),
+                              rte_mempool_avail_count(ct->mp));
+        unixctl_command_reply(fd, JSON_KV_32_FMT("inuse_conns", ""),
+                              rte_mempool_in_use_count(ct->mp));
+        unixctl_command_reply(fd, "}");
+    }
+    unixctl_command_reply(fd, "]\n");
+}
+
+static void
+udp_conn_stats_cmd_cb(int fd, char *argv[], int argc) {
+    if (argc > 0 && strcmp(argv[0], "--json") == 0)
+        udp_conn_stats_json(fd);
+    else
+        udp_conn_stats_normal(fd);
+}
+
+UNIXCTL_CMD_REGISTER("udp/conn/stats", "[--json].",
+                     "Show the number of UDP connections.", 0, 1,
+                     udp_conn_stats_cmd_cb);
