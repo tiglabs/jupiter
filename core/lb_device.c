@@ -923,9 +923,9 @@ netdev_show_ipaddr_cmd_cb(int fd, __attribute__((unused)) char *argv[],
         unixctl_command_reply(fd, "  kni-ip: " IPv4_BE_FMT "\n",
                               IPv4_BE_ARG(dev->ipv4));
         unixctl_command_reply(fd, "  kni-netmask: " IPv4_BE_FMT "\n",
-                              IPv4_BE_ARG(dev->ipv4));
+                              IPv4_BE_ARG(dev->netmask));
         unixctl_command_reply(fd, "  kni-gw: " IPv4_BE_FMT "\n",
-                              IPv4_BE_ARG(dev->ipv4));
+                              IPv4_BE_ARG(dev->gw));
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
             laddr_list = &dev->laddr_list[lcore_id];
             for (i = 0; i < laddr_list->nb; i++) {
@@ -956,7 +956,7 @@ netdev_show_hwinfo_cmd_cb(int fd, __attribute__((unused)) char *argv[],
 
         unixctl_command_reply(fd, "  rxq-num: %u\n", dev->nb_rxq);
         memset(&link_params, 0, sizeof(link_params));
-        rte_eth_link_get(0, &link_params);
+        rte_eth_link_get_nowait(dev->port_id, &link_params);
         unixctl_command_reply(fd, "  link-status: %s\n",
                               link_params.link_status == ETH_LINK_DOWN ? "DOWN"
                                                                        : "UP");
