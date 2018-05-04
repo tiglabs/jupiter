@@ -179,7 +179,8 @@ master_loop(__attribute__((unused)) void *arg) {
             n = rte_kni_rx_burst(ctx[i].kni, pkts, PKT_MAX_BURST);
 
             for (j = 0; j < n; j++) {
-                rte_eth_tx_buffer(n, ctx[i].txq_id, ctx[i].tx_buffer, pkts[j]);
+                rte_eth_tx_buffer(ctx[i].port_id, ctx[i].txq_id,
+                                  ctx[i].tx_buffer, pkts[j]);
             }
 
             rte_eth_tx_buffer_flush(ctx[i].port_id, ctx[i].txq_id,
