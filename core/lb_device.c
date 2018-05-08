@@ -240,11 +240,7 @@ dpdk_dev_config_and_set_ipfilter(uint16_t port_id, struct lb_device *dev,
 
     memset(&dev_conf, 0, sizeof(dev_conf));
     dev_conf.rxmode.mq_mode = ETH_MQ_RX_RSS;
-    if (dev->mtu > ETHER_MTU) {
-        dev_conf.rxmode.max_rx_pkt_len =
-            dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN;
-        dev_conf.rxmode.jumbo_frame = 1;
-    }
+    dev_conf.rxmode.max_rx_pkt_len = ETHER_MAX_LEN;
     dev_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_PROTO_MASK;
     dev_conf.fdir_conf.mode = RTE_FDIR_MODE_PERFECT;
     dev_conf.fdir_conf.mask.ipv4_mask.src_ip = 0xFFFFFFFF;
@@ -372,15 +368,12 @@ lb_device_conf_check_and_adjust(struct lb_device_conf configs[], uint16_t num) {
                 return -1;
             }
 
-            /* Adjust queue_size, mtu .*/
+            /* Adjust queue_size .*/
             rte_eth_dev_info_get(port_id, &info);
             conf->rxqsize = RTE_MIN(conf->rxqsize, info.rx_desc_lim.nb_max);
             conf->rxqsize = RTE_MAX(conf->rxqsize, info.rx_desc_lim.nb_min);
             conf->txqsize = RTE_MIN(conf->txqsize, info.tx_desc_lim.nb_max);
             conf->txqsize = RTE_MAX(conf->txqsize, info.tx_desc_lim.nb_min);
-            conf->mtu = RTE_MIN(conf->mtu, info.max_rx_pktlen - ETHER_HDR_LEN -
-                                               ETHER_CRC_LEN);
-            conf->mtu = RTE_MAX(conf->mtu, ETHER_MIN_MTU);
         }
     }
     return 0;
@@ -394,15 +387,14 @@ init_mempool(struct lb_device *dev) {
     mp_size = dev->nb_rxq * dev->rxq_size + dev->nb_txq * dev->txq_size;
     mp_size += LB_PKTMBUF_POOL_DEFAULT_SIZE;
     snprintf(mp_name, sizeof(mp_name), "mp%p", dev);
-    dev->mp = rte_pktmbuf_pool_create(mp_name, mp_size,
-                                      /* cache_size */
-                                      32,
-                                      /* priv_size */
-                                      0,
-                                      /* data_room_size */
-                                      dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN +
-                                          RTE_PKTMBUF_HEADROOM,
-                                      dev->socket_id);
+    dev->mp =
+        rte_pktmbuf_pool_create(mp_name, mp_size,
+                                /* cache_size */
+                                32,
+                                /* priv_size */
+                                0,
+                                /* data_room_size */
+                                RTE_MBUF_DEFAULT_BUF_SIZE, dev->socket_id);
     if (dev->mp == NULL) {
         RTE_LOG(ERR, USER1, "%s(): Create pktmbuf mempool failed, %s.\n",
                 __func__, rte_strerror(rte_errno));
@@ -422,11 +414,10 @@ init_kni(struct lb_device *dev) {
 
     memset(&kni_conf, 0, sizeof(kni_conf));
     memcpy(kni_conf.name, dev->name, RTE_KNI_NAMESIZE);
-    kni_conf.core_id = 0;
+    kni_conf.core_id = rte_get_master_lcore();
     kni_conf.force_bind = 1;
     kni_conf.group_id = dev->port_id;
-    kni_conf.mbuf_size =
-        dev->mtu + ETHER_HDR_LEN + ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
+    kni_conf.mbuf_size = RTE_MBUF_DEFAULT_DATAROOM;
     if (info.pci_dev) {
         kni_conf.addr = info.pci_dev->addr;
         kni_conf.id = info.pci_dev->id;
@@ -659,7 +650,6 @@ lb_device_init(struct lb_device_conf *configs, uint16_t num) {
         dev->ipv4 = conf->ipv4;
         dev->netmask = conf->netmask;
         dev->gw = conf->gw;
-        dev->mtu = conf->mtu;
         memcpy(dev->name, conf->name, sizeof(dev->name));
 
         rc = init_laddr_list(dev, conf->lips, conf->nb_lips);

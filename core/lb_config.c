@@ -284,7 +284,7 @@ static const struct conf_entry device_entries[] = {
     },
     {
         .name = "mtu",
-        .required = 1,
+        .required = 0,
         .parse = device_entry_parse_mtu,
     },
     {
