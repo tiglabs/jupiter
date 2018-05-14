@@ -879,7 +879,7 @@ netdev_show_stats_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply(fd, "]\n");
 }
 
-UNIXCTL_CMD_REGISTER("netdev/stats", "[--json]", "Show NIC packet statistics.",
+UNIXCTL_CMD_REGISTER("netdev/stats", "[--json].", "Show NIC packet statistics.",
                      0, 1, netdev_show_stats_cmd_cb);
 
 static void

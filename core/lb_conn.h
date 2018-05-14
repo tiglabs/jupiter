@@ -72,15 +72,6 @@ struct lb_conn_table {
     struct rte_timer timer;
     int (*timer_expire_cb)(struct lb_conn *, uint32_t);
     void (*timer_task_cb)(struct lb_conn *);
-    struct {
-        uint64_t syn;
-        uint64_t vip;
-        uint64_t mp;
-        uint64_t hash;
-        uint64_t laddr;
-        uint64_t sched;
-        uint64_t rs;
-    } drop_stats;
 };
 
 #define for_each_conn_safe(var, head, field, tvar)                             \

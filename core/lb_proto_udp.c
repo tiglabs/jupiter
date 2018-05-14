@@ -24,6 +24,7 @@ udp_set_conntrack_state(struct lb_conn *conn, __rte_unused struct udp_hdr *uh,
     if (dir == LB_DIR_ORIGINAL) {
         if (!(conn->flags & LB_CONN_F_ACTIVE)) {
             conn->flags |= LB_CONN_F_ACTIVE;
+            conn->timeout = vs->est_timeout ? vs->est_timeout : udp_timeout;
             rte_atomic32_add(&rs->active_conns, 1);
             rte_atomic32_add(&vs->active_conns, 1);
             vs->stats[lcore_id].conns += 1;
@@ -32,6 +33,7 @@ udp_set_conntrack_state(struct lb_conn *conn, __rte_unused struct udp_hdr *uh,
     } else {
         if (conn->flags & LB_CONN_F_ACTIVE) {
             conn->flags &= ~LB_CONN_F_ACTIVE;
+            conn->timeout = 0;
             rte_atomic32_add(&rs->active_conns, -1);
             rte_atomic32_add(&vs->active_conns, -1);
         }
@@ -204,10 +206,10 @@ udp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
         for_each_conn_safe(conn, &ct->timeout_list, next, tmp) {
             unixctl_command_reply(
                 fd,
-                "cip: " IPv4_BE_FMT ", cport: %u,"
-                "vip: " IPv4_BE_FMT ", vport: %u,"
-                "lip: " IPv4_BE_FMT ", lport: %u,"
-                "rip: " IPv4_BE_FMT ", rport: %u,"
+                "cip: " IPv4_BE_FMT ", cport: %u, "
+                "vip: " IPv4_BE_FMT ", vport: %u, "
+                "lip: " IPv4_BE_FMT ", lport: %u, "
+                "rip: " IPv4_BE_FMT ", rport: %u, "
                 "flags: 0x%x, usetime:%u, timeout=%u\n",
                 IPv4_BE_ARG(conn->cip), rte_be_to_cpu_16(conn->cport),
                 IPv4_BE_ARG(conn->vip), rte_be_to_cpu_16(conn->vport),

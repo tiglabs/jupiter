@@ -653,41 +653,6 @@ static struct lb_proto proto_tcp = {
 LB_PROTO_REGISTER(proto_tcp);
 
 static void
-tcp_drop_stats_cmd_cb(int fd, __attribute__((unused)) char *argv[],
-                      __attribute__((unused)) int argc) {
-    uint32_t lcore_id;
-    struct lb_conn_table *ct;
-    uint64_t syn = 0;
-    uint64_t vip = 0;
-    uint64_t mp = 0;
-    uint64_t hash = 0;
-    uint64_t laddr = 0;
-    uint64_t sched = 0;
-    uint64_t rs = 0;
-
-    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        ct = &lb_conn_tbls[lcore_id];
-        syn += ct->drop_stats.syn;
-        vip += ct->drop_stats.vip;
-        mp += ct->drop_stats.mp;
-        hash += ct->drop_stats.hash;
-        laddr += ct->drop_stats.laddr;
-        sched += ct->drop_stats.sched;
-        rs += ct->drop_stats.rs;
-    }
-    unixctl_command_reply(fd, NORM_KV_64_FMT("syn", "\n"), syn);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("vip", "\n"), vip);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("mp", "\n"), mp);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("hash", "\n"), hash);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("laddr", "\n"), laddr);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("sched", "\n"), sched);
-    unixctl_command_reply(fd, NORM_KV_64_FMT("rs", "\n"), rs);
-}
-
-UNIXCTL_CMD_REGISTER("tcp/drop/stats", "", "Show TCP drop information.", 0, 0,
-                     tcp_drop_stats_cmd_cb);
-
-static void
 tcp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
                      __attribute__((unused)) int argc) {
     uint32_t lcore_id;
@@ -701,10 +666,10 @@ tcp_conn_dump_cmd_cb(int fd, __attribute__((unused)) char *argv[],
         for_each_conn_safe(conn, &ct->timeout_list, next, tmp) {
             unixctl_command_reply(
                 fd,
-                "cip: " IPv4_BE_FMT ", cport: %u,"
-                "vip: " IPv4_BE_FMT ", vport: %u,"
-                "lip: " IPv4_BE_FMT ", lport: %u,"
-                "rip: " IPv4_BE_FMT ", rport: %u,"
+                "cip: " IPv4_BE_FMT ", cport: %u, "
+                "vip: " IPv4_BE_FMT ", vport: %u, "
+                "lip: " IPv4_BE_FMT ", lport: %u, "
+                "rip: " IPv4_BE_FMT ", rport: %u, "
                 "flags: 0x%x, state: %s, usetime:%u, timeout=%u\n",
                 IPv4_BE_ARG(conn->cip), rte_be_to_cpu_16(conn->cport),
                 IPv4_BE_ARG(conn->vip), rte_be_to_cpu_16(conn->vport),
