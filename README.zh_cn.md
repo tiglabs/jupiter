@@ -10,7 +10,6 @@ Jupiter是一个基于DPDK实现的高性能4层网络负载均衡服务，支�
 * 支持应用会话保持
 * 支持负载均衡服务横向扩展
 * 高性能，单机支持百万QPS
-* 支持对访客IP限速，防止恶意流量
 
 ## 下载使用
 
@@ -32,17 +31,18 @@ jupiter-service的默认配置文件路径是/etc/jupiter/jupiter.cfg，配置�
 EAL配置参数参考[DPDK文档](http://dpdk.org/doc/guides/testpmd_app_ug/run_app.html#eal-command-line-options).
 
 ```vim
-[EAL]
-cores = 1-3
-memory = 4096,0
-mem-channels = 4
+[DPDK]
+argv = -c 0xf -n 4
 
-[NETDEV]
-name-prefix = jupiter
-ip-local-address = 10.0.2.1, 10.0.2.2
-kni-ipv4 = 1.1.1.2
-kni-netmask = 255.255.255.0
-kni-gateway = 1.1.1.254
+[DEVICE0]
+name = jupiter0
+ipv4 = 1.1.1.2
+netmask = 255.255.0.0
+gw = 1.1.1.254
+rxqsize = 256
+txqsize = 512
+local-ipv4 = 10.0.2.1/32, 10.0.2.2/32
+pci = 00:00.0
 ```
 
 配置hugepage:
@@ -97,7 +97,7 @@ route add -net 10.0.2.0 netmask 255.255.255.0 gw 1.1.1.2
 
 ```bash
 ifconfig jupiter0 1.1.1.2/24 up
-jupiter-ctl vs/add 10.0.1.1:8888 tcp
+jupiter-ctl vs/add 10.0.1.1:8888 tcp rr
 jupiter-ctl rs/add 10.0.1.1:8888 tcp 1.1.1.3:80
 jupiter-ctl rs/add 10.0.1.1:8888 tcp 1.1.1.4:80
 ```
