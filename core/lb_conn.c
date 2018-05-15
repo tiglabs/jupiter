@@ -136,7 +136,7 @@ __conn_expire(struct lb_conn_table *ct, struct lb_conn *conn) {
     IPv4_4TUPLE(&tuple, conn->cip, conn->cport, conn->vip, conn->vport);
     rte_hash_del_key(ct->hash, (const void *)&tuple);
 
-    IPv4_4TUPLE(&tuple, conn->lip, conn->lport, conn->rip, conn->rport);
+    IPv4_4TUPLE(&tuple, conn->rip, conn->rport, conn->lip, conn->lport);
     rte_hash_del_key(ct->hash, (const void *)&tuple);
 
     lb_laddr_put(conn->laddr, conn->lport, ct->type);
