@@ -72,15 +72,21 @@ device_entry_parse_mode(const char *token, void *_conf) {
     struct lb_device_conf *conf = _conf;
     uint32_t mode;
 
-    if (strcmp(token, "rr") == 0)
-        mode = BONDING_MODE_ROUND_ROBIN;
-    else if (strcmp(token, "active-backup") == 0)
-        mode = BONDING_MODE_ACTIVE_BACKUP;
-    else
+    if (parser_read_uint32(&mode, token) < 0)
         return -1;
-
-    conf->mode = mode;
-    return 0;
+    switch (mode) {
+    case BONDING_MODE_ROUND_ROBIN:
+    case BONDING_MODE_ACTIVE_BACKUP:
+    case BONDING_MODE_BALANCE:
+    case BONDING_MODE_BROADCAST:
+    case BONDING_MODE_8023AD:
+    case BONDING_MODE_TLB:
+    case BONDING_MODE_ALB:
+        conf->mode = mode;
+        return 0;
+    default:
+        return -1;
+    }
 }
 
 static int
@@ -418,4 +424,3 @@ lb_config_file_load(const char *cfgfile_path) {
 
     return 0;
 }
-
