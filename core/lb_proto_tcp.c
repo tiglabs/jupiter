@@ -519,7 +519,7 @@ tcp_fullnat_recv_client(struct rte_mbuf *m, struct ipv4_hdr *iph,
         if (conn == NULL) {
             TCP_PRINT(IPv4_TCP_FMT " [CONN SCHEDULE DROP]\n",
                       IPv4_TCP_ARG(iph, th));
-            rte_pktmbuf_free(m);
+            tcp_response_rst(m, iph, th, dev);
             return 0;
         }
     }
