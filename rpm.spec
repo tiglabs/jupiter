@@ -24,12 +24,17 @@ make machine=%{_machine}
 
 %install
 rm -rf %{buildroot}
-make install DESTDIR=%{buildroot} bindir=%{_bindir} tooldir=%{_datadir}/jupiter/tools kmoddir=%{_datadir}/jupiter/kmod confdir=/etc/jupiter machine=%{_machine}
+make install DESTDIR=%{buildroot} \
+             bindir=%{_bindir} \
+             tooldir=%{_datadir}/jupiter/tools \
+             kmoddir=%{_datadir}/jupiter/kmod \
+             confdir=%{_sysconfdir}/jupiter \
+             machine=%{_machine}
 
 %files
 %{_bindir}/*
 %{_datadir}/jupiter
-/etc/jupiter
+%config %{_sysconfdir}/jupiter
 
 %post
 /sbin/ldconfig
