@@ -440,6 +440,11 @@ tcp_response_rst(struct rte_mbuf *m, struct ipv4_hdr *iph, struct tcp_hdr *th,
     uint32_t seq, ack;
     uint8_t tcp_flags;
 
+    if (RST(th)) {
+        rte_pktmbuf_free(m);
+        return;
+    }
+
     rte_pktmbuf_reset(m);
     m->pkt_len = m->data_len =
         ETHER_HDR_LEN + sizeof(struct ipv4_hdr) + sizeof(struct tcp_hdr);
