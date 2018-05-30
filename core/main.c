@@ -25,6 +25,10 @@
 
 #define VERSION "0.1"
 
+#ifndef IPPROTO_OSPFIGP
+#define IPPROTO_OSPFIGP 89
+#endif
+
 #define RUN_ONCE_N_MS(f, n)                                                    \
     do {                                                                       \
         static uint64_t last_tsc = 0;                                          \
@@ -115,7 +119,8 @@ handle_packets(struct rte_mbuf **pkts, uint16_t n, struct lb_device *dev) {
             break;
         case ETHER_TYPE_IPv4:
             iph = rte_pktmbuf_mtod_offset(m, struct ipv4_hdr *, ETHER_HDR_LEN);
-            if (iph->dst_addr == dev->ipv4) {
+            if ((iph->dst_addr == dev->ipv4) ||
+                (iph->next_proto_id == IPPROTO_OSPFIGP)) {
                 if (rte_ring_enqueue(dev->ring, m) < 0) {
                     rte_pktmbuf_free(m);
                 }
