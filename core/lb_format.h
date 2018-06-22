@@ -3,9 +3,11 @@
 #ifndef __LB_FORMAT_H__
 #define __LB_FORMAT_H__
 
-#define JSON_KV_S_FMT(K, D)  "\"" K "\"" ":" "\"" "%s" "\"" D
-#define JSON_KV_64_FMT(K, D) "\"" K "\"" ":" "%" PRIu64 D
-#define JSON_KV_32_FMT(K, D) "\"" K "\"" ":" "%" PRIu32 D
+#define JSON_K_FMT(K) "\"" K "\""
+
+#define JSON_KV_S_FMT(K, D)  JSON_K_FMT(K) ":" "\"" "%s" "\"" D
+#define JSON_KV_64_FMT(K, D) JSON_K_FMT(K) ":" "%" PRIu64 D
+#define JSON_KV_32_FMT(K, D) JSON_K_FMT(K) ":" "%" PRIu32 D
 
 #define NORM_KV_S_FMT(K, D)  K ": %s" D
 #define NORM_KV_64_FMT(K, D) K ": %" PRIu64 D

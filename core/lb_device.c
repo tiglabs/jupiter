@@ -1197,7 +1197,7 @@ laddr_stats_arg_parse(char *argv[], int argc, int *json_fmt) {
 
 static void
 laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
-    int json_fmt = 0, json_first_obj = 1;
+    int json_fmt = 0, json_first_obj, json_first_obj2;
     int rc;
     uint16_t devid;
     struct lb_device *dev;
@@ -1215,9 +1215,10 @@ laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
     if (json_fmt)
         unixctl_command_reply(fd, "[");
 
+    json_first_obj = 1;
     LB_DEVICE_FOREACH(devid, dev) {
-        uint32_t total_lports[LB_IPPROTO_MAX] = {0},
-                 avail_lports[LB_IPPROTO_MAX] = {0};
+        uint32_t inuse_lports[RTE_MAX_LCORE][LB_IPPROTO_MAX] = {{0}},
+                 avail_lports[RTE_MAX_LCORE][LB_IPPROTO_MAX] = {{0}};
 
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
             laddr_list = &dev->laddr_list[lcore_id];
@@ -1225,8 +1226,11 @@ laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
                 laddr = &laddr_list->entries[i];
                 for (j = 0; j < LB_IPPROTO_MAX; j++) {
                     if (laddr->ports[j] != NULL) {
-                        avail_lports[j] += rte_ring_count(laddr->ports[j]);
-                        total_lports[j] += LB_MAX_L4_PORT - LB_MIN_L4_PORT;
+                        uint32_t avail;
+                        avail = rte_ring_count(laddr->ports[j]);
+                        avail_lports[lcore_id][j] += avail;
+                        inuse_lports[lcore_id][j] +=
+                            LB_MAX_L4_PORT - LB_MIN_L4_PORT - avail;
                     }
                 }
             }
@@ -1234,28 +1238,66 @@ laddr_stats_cmd_cb(int fd, char *argv[], int argc) {
 
         if (!json_fmt) {
             unixctl_command_reply(fd, "dev: %s\n", dev->name);
-            unixctl_command_reply(fd, "  type: TCP\n");
-            unixctl_command_reply(fd, "    avail_lports: %u\n",
-                                  avail_lports[LB_IPPROTO_TCP]);
-            unixctl_command_reply(fd, "    total_lports: %u\n",
-                                  total_lports[LB_IPPROTO_TCP]);
-            unixctl_command_reply(fd, "  type: UDP\n");
-            unixctl_command_reply(fd, "    avail_lports: %u\n",
-                                  avail_lports[LB_IPPROTO_UDP]);
-            unixctl_command_reply(fd, "    total_lports: %u\n",
-                                  total_lports[LB_IPPROTO_UDP]);
+
+            unixctl_command_reply(fd, "  lcore           :");
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, " %-10" PRIu32, lcore_id);
+            }
+            unixctl_command_reply(fd, "\n");
+
+            unixctl_command_reply(fd, "  tcp_avail_lports:");
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, " %-10" PRIu32,
+                                      avail_lports[lcore_id][LB_IPPROTO_TCP]);
+            }
+            unixctl_command_reply(fd, "\n");
+
+            unixctl_command_reply(fd, "  tcp_inuse_lports:");
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, " %-10" PRIu32,
+                                      inuse_lports[lcore_id][LB_IPPROTO_TCP]);
+            }
+            unixctl_command_reply(fd, "\n");
+
+            unixctl_command_reply(fd, "  udp_avail_lports:");
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, " %-10" PRIu32,
+                                      avail_lports[lcore_id][LB_IPPROTO_UDP]);
+            }
+            unixctl_command_reply(fd, "\n");
+
+            unixctl_command_reply(fd, "  udp_inuse_lports:");
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, " %-10" PRIu32,
+                                      inuse_lports[lcore_id][LB_IPPROTO_UDP]);
+            }
+            unixctl_command_reply(fd, "\n");
         } else {
             unixctl_command_reply(fd, json_first_obj ? "{" : ",{");
             json_first_obj = 0;
-            unixctl_command_reply(fd, JSON_KV_S_FMT("dev", ","), dev->name);
-            unixctl_command_reply(fd, JSON_KV_32_FMT("tcp_avail_lports", ","),
-                                  avail_lports[LB_IPPROTO_TCP]);
-            unixctl_command_reply(fd, JSON_KV_32_FMT("tcp_total_lports", ","),
-                                  total_lports[LB_IPPROTO_TCP]);
-            unixctl_command_reply(fd, JSON_KV_32_FMT("udp_avail_lports", ","),
-                                  avail_lports[LB_IPPROTO_UDP]);
-            unixctl_command_reply(fd, JSON_KV_32_FMT("udp_total_lports", "}"),
-                                  avail_lports[LB_IPPROTO_UDP]);
+            unixctl_command_reply(fd, JSON_K_FMT("%s"), dev->name);
+            unixctl_command_reply(fd, ":[");
+            json_first_obj2 = 1;
+            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+                unixctl_command_reply(fd, json_first_obj2 ? "{" : ",{");
+                json_first_obj2 = 0;
+                unixctl_command_reply(fd, JSON_KV_32_FMT("lcore", ","),
+                                      lcore_id);
+                unixctl_command_reply(fd,
+                                      JSON_KV_32_FMT("tcp_avail_lports", ","),
+                                      avail_lports[lcore_id][LB_IPPROTO_TCP]);
+                unixctl_command_reply(fd,
+                                      JSON_KV_32_FMT("tcp_inuse_lports", ","),
+                                      inuse_lports[lcore_id][LB_IPPROTO_TCP]);
+                unixctl_command_reply(fd,
+                                      JSON_KV_32_FMT("udp_avail_lports", ","),
+                                      avail_lports[lcore_id][LB_IPPROTO_UDP]);
+                unixctl_command_reply(fd,
+                                      JSON_KV_32_FMT("udp_inuse_lports", "}"),
+                                      inuse_lports[lcore_id][LB_IPPROTO_UDP]);
+            }
+            unixctl_command_reply(fd, "]");
+            unixctl_command_reply(fd, "}");
         }
     }
 
