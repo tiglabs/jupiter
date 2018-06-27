@@ -16,8 +16,6 @@
 #include "lb_synproxy.h"
 #include "lb_tcp_secret_seq.h"
 
-#define LB_MAX_CONN (1 << 20)
-
 #define LB_CONN_F_SYNPROXY (0x01)
 #define LB_CONN_F_ACTIVE (0x02)
 #define LB_CONN_F_TOA (0x4)
@@ -86,7 +84,7 @@ struct lb_conn *lb_conn_find(struct lb_conn_table *ct, uint32_t sip,
                              uint32_t dip, uint16_t sport, uint16_t dport,
                              uint8_t *dir);
 int lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
-                       uint32_t lcore_id, uint32_t timeout,
+                       uint32_t lcore_id, uint32_t timeout, uint32_t size,
                        void (*task_cb)(struct lb_conn *),
                        int (*expire_cb)(struct lb_conn *, uint32_t));
 

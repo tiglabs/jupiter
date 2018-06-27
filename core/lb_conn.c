@@ -175,7 +175,7 @@ conn_table_expire_cb(__attribute((unused)) struct rte_timer *timer, void *arg) {
 
 int
 lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
-                   uint32_t lcore_id, uint32_t timeout,
+                   uint32_t lcore_id, uint32_t timeout, uint32_t size,
                    void (*task_cb)(struct lb_conn *),
                    int (*expire_cb)(struct lb_conn *, uint32_t)) {
     struct rte_hash_parameters param;
@@ -189,7 +189,7 @@ lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
     memset(&param, 0, sizeof(param));
     snprintf(name, sizeof(name), "ct_hash%p", ct);
     param.name = name;
-    param.entries = LB_MAX_CONN * 2;
+    param.entries = size * 2;
     param.key_len = sizeof(struct ipv4_4tuple);
     param.hash_func = rte_hash_crc;
     param.socket_id = socket_id;
@@ -202,8 +202,8 @@ lb_conn_table_init(struct lb_conn_table *ct, enum lb_proto_type type,
     }
 
     snprintf(name, sizeof(name), "ct_mp%p", ct);
-    ct->mp = rte_mempool_create(name, LB_MAX_CONN, sizeof(struct lb_conn), 0, 0,
-                                NULL, NULL, NULL, NULL, socket_id,
+    ct->mp = rte_mempool_create(name, size, sizeof(struct lb_conn), 0, 0, NULL,
+                                NULL, NULL, NULL, socket_id,
                                 MEMPOOL_F_SP_PUT | MEMPOOL_F_SC_GET);
     if (ct->mp == NULL) {
         RTE_LOG(ERR, USER1, "%s(): Create mempool %s failed, %s\n", __func__,

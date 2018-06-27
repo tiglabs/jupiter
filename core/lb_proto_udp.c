@@ -11,6 +11,8 @@
 #include "lb_format.h"
 #include "lb_proto.h"
 
+#define UDP_MAX_CONN (1 << 20)
+
 static struct lb_conn_table lb_conn_tbls[RTE_MAX_LCORE];
 static uint32_t udp_timeout = 30 * LB_CLOCK_HZ;
 
@@ -167,11 +169,13 @@ udp_fullnat_init(void) {
     uint32_t lcore_id;
     struct lb_conn_table *ct;
     int rc;
+    uint32_t size;
 
+    size = UDP_MAX_CONN / (rte_lcore_count() - 1);
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
         ct = &lb_conn_tbls[lcore_id];
-        rc = lb_conn_table_init(ct, LB_IPPROTO_UDP, lcore_id, udp_timeout, NULL,
-                                udp_conn_timer_expire_cb);
+        rc = lb_conn_table_init(ct, LB_IPPROTO_UDP, lcore_id, udp_timeout, size,
+                                NULL, udp_conn_timer_expire_cb);
         if (rc < 0) {
             RTE_LOG(ERR, USER1, "%s(): lb_conn_table_init failed.\n", __func__);
             return rc;

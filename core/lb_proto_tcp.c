@@ -40,6 +40,8 @@
         SYN(th) ? 'S' : '-', ACK(th) ? 'A' : '-', RST(th) ? 'R' : '-',         \
         FIN(th) ? 'F' : '-'
 
+#define TCP_MAX_CONN (1 << 22)
+
 #define sNO TCP_CONNTRACK_NONE
 #define sSS TCP_CONNTRACK_SYN_SENT
 #define sSR TCP_CONNTRACK_SYN_RECV
@@ -631,12 +633,14 @@ tcp_fullnat_init(void) {
     uint32_t lcore_id;
     struct lb_conn_table *ct;
     int rc;
+    int size;
 
+    size = TCP_MAX_CONN / (rte_lcore_count() - 1);
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
         ct = &lb_conn_tbls[lcore_id];
         rc = lb_conn_table_init(
             ct, LB_IPPROTO_TCP, lcore_id, tcp_timeouts[TCP_CONNTRACK_NONE],
-            tcp_conn_timer_task_cb, tcp_conn_timer_expire_cb);
+            size, tcp_conn_timer_task_cb, tcp_conn_timer_expire_cb);
         if (rc < 0) {
             RTE_LOG(ERR, USER1, "%s(): lb_conn_table_init failed.\n", __func__);
             return rc;
