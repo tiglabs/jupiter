@@ -11,10 +11,12 @@ machine = native
 endif
 
 RTE_SDK = $(CURDIR)/dpdk
-export RTE_SDK
+RTE_TARGET = x86_64-$(machine)-linuxapp-gcc
+LB_DIR = $(CURDIR)
 
-RTE_TARGET ?= x86_64-native-linuxapp-gcc
+export RTE_SDK
 export RTE_TARGET
+export LB_DIR
 
 ifeq ($(bindir),)
 bindir = /usr/local/jupiter/bin
@@ -39,20 +41,20 @@ all: dpdk jupiter
 
 .PHONY: dpdk
 dpdk:
-	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET) T=$(RTE_TARGET) config
+	$(Q)$(MAKE) -C $(RTE_SDK) O=$(RTE_TARGET) T=$(RTE_TARGET) config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MACHINE=).*,\1$(machine),' $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_APP_TEST=).*,\1n,'         $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_LIBRTE_PMD_PCAP=).*,\1y,'  $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_KNI_KMOD_ETHTOOL=).*,\1n,' $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MAX_NUMA_NODES=).*,\12,'   $(RTE_TARGET)/.config
 	$(Q)cd $(RTE_SDK) && sed -ri 's,(RTE_MAX_ETHPORTS=).*,\18,'     $(RTE_TARGET)/.config
-	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET)
+	$(Q)$(MAKE) -C $(RTE_SDK) O=$(RTE_TARGET)
 
 .PHONY: jupiter
 jupiter:
-	$(Q)cd lib && $(MAKE) O=$(RTE_TARGET)
-	$(Q)cd cmd && $(MAKE) O=$(RTE_TARGET)
-	$(Q)cd core && $(MAKE) O=$(RTE_TARGET)
+	$(Q)$(MAKE) -C $(LB_DIR)/lib
+	$(Q)$(MAKE) -C $(LB_DIR)/cmd O=$(RTE_TARGET)
+	$(Q)$(MAKE) -C $(LB_DIR)/core O=$(RTE_TARGET)
 
 .PHONY: install
 install:
@@ -101,10 +103,9 @@ rpm-pkg:
 		--define "_machine $(machine)" \
 		rpmbuild/SPECS/rpm.spec
 
-
 .PHONY: clean
 clean:
-	$(Q)cd $(RTE_SDK) && $(MAKE) O=$(RTE_TARGET) clean
-	$(Q)cd lib && $(MAKE) O=$(RTE_TARGET) clean
-	$(Q)cd cmd && $(MAKE) O=$(RTE_TARGET) clean
-	$(Q)cd core && $(MAKE) O=$(RTE_TARGET) clean
+	$(Q)$(MAKE) -C $(RTE_SDK) clean O=$(RTE_TARGET)
+	$(Q)$(MAKE) -C $(LB_DIR)/lib clean
+	$(Q)$(MAKE) -C $(LB_DIR)/cmd clean O=$(RTE_TARGET)
+	$(Q)$(MAKE) -C $(LB_DIR)/core clean O=$(RTE_TARGET)

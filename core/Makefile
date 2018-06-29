@@ -1,13 +1,5 @@
 # Copyright (c) 2018. TIG developer.
 
-ifeq ($(RTE_SDK),)
-$(error "Please define RTE_SDK environment variable")
-endif
-
-ifeq ($(RTE_TARGET),)
-$(error "Please define RTE_TARGET environment variable")
-endif
-
 include $(RTE_SDK)/mk/rte.vars.mk
 
 # binary name
@@ -21,10 +13,10 @@ SRCS-y := main.c lb_device.c lb_arp.c lb_parser.c lb_service.c lb_scheduler.c \
 
 CFLAGS += $(WERROR_FLAGS) -g -O3
 
-CFLAGS += -I$(SRCDIR)/../lib/libconhash/$(RTE_TARGET)/include
-LDLIBS += -L$(SRCDIR)/../lib/libconhash/$(RTE_TARGET)/lib -lconhash
+CFLAGS += -I$(LB_DIR)/lib/libconhash/$(RTE_TARGET)/include
+LDLIBS += -L$(LB_DIR)/lib/libconhash/$(RTE_TARGET)/lib -lconhash
 
-CFLAGS += -I$(SRCDIR)/../lib/libcmd/$(RTE_TARGET)/include
-LDLIBS += -L$(SRCDIR)/../lib/libcmd/$(RTE_TARGET)/lib -lcmd
+CFLAGS += -I$(LB_DIR)/lib/libcmd/$(RTE_TARGET)/include
+LDLIBS += -L$(LB_DIR)/lib/libcmd/$(RTE_TARGET)/lib -lcmd
 
 include $(RTE_SDK)/mk/rte.extapp.mk

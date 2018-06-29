@@ -1,9 +1,5 @@
 # Copyright (c) 2018. TIG developer.
 
-ifeq ($(RTE_SDK),)
-$(error "Please define RTE_SDK environment variable")
-endif
-
 include $(RTE_SDK)/mk/rte.vars.mk
 
 # binary name
