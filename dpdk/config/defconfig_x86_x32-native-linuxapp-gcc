@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2010-2014 Intel Corporation
+
+#include "common_linuxapp"
+
+CONFIG_RTE_MACHINE="native"
+
+CONFIG_RTE_ARCH="x86_x32"
+CONFIG_RTE_ARCH_X86_X32=y
+CONFIG_RTE_ARCH_X86=y
+
+CONFIG_RTE_TOOLCHAIN="gcc"
+CONFIG_RTE_TOOLCHAIN_GCC=y
+
+#
+# KNI is not supported on 32-bit
+#
+CONFIG_RTE_LIBRTE_KNI=n
+
+#
+# Solarflare PMD is not supported on 32-bit
+#
+CONFIG_RTE_LIBRTE_SFC_EFX_PMD=n
+
+#
+# AVP PMD is not supported on 32-bit
+#
+CONFIG_RTE_LIBRTE_AVP_PMD=n

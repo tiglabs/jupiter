@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2015 Cavium, Inc
+#
+
+#include "defconfig_arm64-armv8a-linuxapp-gcc"
+
+CONFIG_RTE_MACHINE="thunderx"
+
+CONFIG_RTE_CACHE_LINE_SIZE=128
+CONFIG_RTE_MAX_NUMA_NODES=2
+CONFIG_RTE_MAX_LCORE=96
+CONFIG_RTE_MAX_VFIO_GROUPS=128
+CONFIG_RTE_RING_USE_C11_MEM_MODEL=n
+
+#
+# Compile PMD for octeontx sso event device
+#
+CONFIG_RTE_LIBRTE_PMD_OCTEONTX_SSOVF=y
