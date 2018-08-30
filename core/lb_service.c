@@ -184,7 +184,7 @@ vs_tbl_del(struct lb_vs_table *t, struct lb_virt_service *vs) {
     count = (uint32_t)(uintptr_t)p;
     count -= 1;
     if (count == 0) {
-        rte_hash_del_key(t->vs_htbl, &key);
+        rte_hash_del_key(t->vip_htbl, &key);
     } else {
         rte_hash_add_key_data(t->vip_htbl, &vs->vip, (void *)(uintptr_t)count);
     }
