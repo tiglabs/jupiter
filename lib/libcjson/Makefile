@@ -2,12 +2,12 @@
 
 include $(RTE_SDK)/mk/rte.vars.mk
 
-# binary name
-LIB = libconhash.a
+# library name
+LIB = libcjson.a
 
 # all source are stored in SRCS-y
-SRCS-y := conhash.c conhash_inter.c conhash_util.c md5.c util_rbtree.c
-SYMLINK-y-include += conhash.h configure.h
+SRCS-y := cjson.c
+SYMLINK-y-include += cjson.h
 
 CFLAGS += $(WERROR_FLAGS) -g -O2
 

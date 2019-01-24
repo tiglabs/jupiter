@@ -113,6 +113,8 @@ unixctl_command_reply(int fd, const char *format, ...) {
     va_list ap;
     int buf_len;
 
+    if (!format)
+        return -1;
     va_start(ap, format);
     buf_len = vsnprintf(buf, CMDMSG_DATA_SIZE, format, ap);
     va_end(ap);
@@ -127,12 +129,21 @@ unixctl_command_reply_error(int fd, const char *format, ...) {
     va_list ap;
     int buf_len;
 
+    if (!format)
+        return -1;
     va_start(ap, format);
     buf_len = vsnprintf(buf, CMDMSG_DATA_SIZE, format, ap);
     va_end(ap);
     if (buf_len < 0)
         return -1;
     return __unixctl_command_reply(fd, TRUE, buf, buf_len);
+}
+
+int
+unixctl_command_reply_string(int fd, const char *string) {
+    if (!string)
+        return -1;
+    return __unixctl_command_reply(fd, FALSE, string, strlen(string));
 }
 
 static void
@@ -302,4 +313,3 @@ unixctl_client_request(int fd, const char *cmdline) {
     }
     return 0;
 }
-

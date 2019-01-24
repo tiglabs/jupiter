@@ -24,10 +24,12 @@
 #define NODE_FLAG_INIT  0x01 /* node is initialized */
 #define NODE_FLAG_IN    0x02 /* node is added in the server */
 
+#define NODE_IDEN_SIZE 64
+
 /* nodes structure */
 struct node_s
 {
-	char iden[64]; /* node name or some thing identifies the node */
+	char iden[NODE_IDEN_SIZE]; /* node name or some thing identifies the node */
     u_int replicas; /* number of replica virtual nodes */
     u_int flag;
 	void *userdata;

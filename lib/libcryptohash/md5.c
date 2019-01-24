@@ -1,20 +1,17 @@
 /* Copyright (c) 2018. TIG developer. */
 
-#ifndef __LB_MD5_H__
-#define __LB_MD5_H__
+#include <stdint.h>
 
-#define MD5_DIGEST_WORDS 4
-#define MD5_MESSAGE_BYTES 64
+#include "cryptohash.h"
 
 #define F1(x, y, z) (z ^ (x & (y ^ z)))
 #define F2(x, y, z) F1(z, x, y)
 #define F3(x, y, z) (x ^ y ^ z)
 #define F4(x, y, z) (y ^ (x | ~z))
 
-#define MD5STEP(f, w, x, y, z, in, s)                                          \
-    (w += f(x, y, z) + in, w = (w << s | w >> (32 - s)) + x)
+#define MD5STEP(f, w, x, y, z, in, s) (w += f(x, y, z) + in, w = (w << s | w >> (32 - s)) + x)
 
-static inline void
+void
 md5_transform(uint32_t *hash, uint32_t const *in) {
     uint32_t a, b, c, d;
 
@@ -96,6 +93,3 @@ md5_transform(uint32_t *hash, uint32_t const *in) {
     hash[2] += c;
     hash[3] += d;
 }
-
-#endif
-

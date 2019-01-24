@@ -6,20 +6,25 @@
 #include <rte_kni.h>
 #include <rte_pci.h>
 
+#include "lb_ip_address.h"
+
 #define LB_MAX_LADDR 256
 
 struct lb_device_conf {
     char name[RTE_KNI_NAMESIZE];
-    uint32_t mode;
-    uint32_t ipv4;
-    uint32_t netmask;
-    uint32_t gw;
-    uint16_t rxqsize, txqsize;
-    uint16_t mtu;
-    uint32_t rxoffload;
-    uint32_t txoffload;
-    uint32_t nb_lips;
-    uint32_t lips[LB_MAX_LADDR];
+    ip4_address_t ip4;
+    ip4_address_t ip4_gw;
+    ip4_address_t ip4_netmask;
+    uint16_t ip4_prefix;
+    ip6_address_t ip6;
+    ip6_address_t ip6_gw;
+    ip6_address_t ip6_netmask;
+    uint16_t ip6_prefix;
+
+    uint32_t nb_fnat_laddr_v4;
+    uint32_t nb_fnat_laddr_v6;
+    ip4_address_t fnat_laddrs_v4[LB_MAX_LADDR];
+    ip6_address_t fnat_laddrs_v6[LB_MAX_LADDR];
     uint16_t nb_pcis;
     struct rte_pci_addr pcis[RTE_MAX_ETHPORTS];
 };
@@ -32,14 +37,14 @@ struct lb_dpdk_conf {
 };
 
 struct lb_conf {
-    struct lb_device_conf devices[RTE_MAX_ETHPORTS];
-    uint16_t nb_decices;
+    struct lb_device_conf inbound;
+    struct lb_device_conf outbound;
     struct lb_dpdk_conf dpdk;
 };
 
 extern struct lb_conf *lb_cfg;
 
 int lb_config_file_load(const char *cfgfile_path);
+void lb_config_print(void);
 
 #endif
-

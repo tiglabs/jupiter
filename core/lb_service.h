@@ -3,19 +3,15 @@
 #ifndef __LB_SERVICE_H__
 #define __LB_SERVICE_H__
 
+#include <rte_rwlock.h>
 #include <sys/queue.h>
 
-#include <rte_atomic.h>
-#include <rte_rwlock.h>
-
-#include "lb_proto.h"
+#include "lb.h"
+#include "lb_ip_address.h"
 #include "lb_scheduler.h"
-
-#define LB_MAX_VS (1 << 16)
 
 #define LB_VS_F_SYNPROXY (0x01)
 #define LB_VS_F_TOA (0x02)
-#define LB_VS_F_CQL (0x04)
 
 #define LB_RS_F_AVAILABLE (0x1)
 
@@ -29,62 +25,38 @@ struct lb_service_stats {
 struct lb_real_service;
 
 struct lb_virt_service {
-    uint32_t vip;
+    ip46_address_t vaddr;
     uint16_t vport;
-    uint8_t proto;
-
-    uint32_t est_timeout;
-    int max_conns;
+    lb_proto_t proto;
+    uint32_t flags;
     rte_atomic32_t active_conns;
     rte_atomic32_t refcnt;
-
-    uint32_t flags;
-
-    uint32_t socket_id;
-
     rte_rwlock_t rwlock;
-
-    const struct lb_scheduler *sched;
-    void *sched_data;
-
+    struct lb_scheduler sched;
     LIST_HEAD(, lb_real_service) real_services;
-
+    uint32_t est_timeout;
+    int max_conns;
     struct lb_service_stats stats[RTE_MAX_LCORE];
 };
 
 struct lb_real_service {
+    struct lb_sched_node sched_node;
     LIST_ENTRY(lb_real_service) next;
-    uint32_t rip;
+    struct lb_virt_service *virt_service;
+    ip46_address_t raddr;
     uint16_t rport;
-    uint8_t proto;
-
     uint32_t flags;
-
     rte_atomic32_t active_conns;
     rte_atomic32_t refcnt;
-
-    int weight;
-
-    struct lb_virt_service *virt_service;
-    void *sched_node;
-
     struct lb_service_stats stats[RTE_MAX_LCORE];
 };
 
-int lb_is_vip_exist(uint32_t vip);
-struct lb_virt_service *lb_vs_get(uint32_t vip, uint16_t vport, uint8_t proto);
+struct lb_virt_service *lb_vs_get(void *ip, uint16_t vport, lb_proto_t proto,
+                                  uint8_t is_ip4);
+struct lb_real_service *lb_vs_get_rs(struct lb_virt_service *vs, void *caddr,
+                                     uint16_t cport, uint8_t is_ip4);
 void lb_vs_put(struct lb_virt_service *vs);
-struct lb_real_service *lb_vs_get_rs(struct lb_virt_service *vs, uint32_t cip,
-                                     uint16_t cport);
-void lb_vs_put_rs(struct lb_real_service *rs);
-void lb_vs_free(struct lb_virt_service *vs);
-void lb_rs_free(struct lb_real_service *rs);
-int lb_service_init(void);
-
-static inline int
-lb_vs_check_max_conn(struct lb_virt_service *vs) {
-    return rte_atomic32_read(&vs->active_conns) >= vs->max_conns;
-}
+void lb_rs_put(struct lb_real_service *rs);
+int lb_service_module_init(void);
 
 #endif
-

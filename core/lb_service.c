@@ -1,608 +1,596 @@
 /* Copyright (c) 2018. TIG developer. */
 
-#include <sys/queue.h>
-
 #include <rte_errno.h>
-#include <rte_ethdev.h>
 #include <rte_hash.h>
 #include <rte_hash_crc.h>
-#include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_rwlock.h>
 
+#include <cjson.h>
 #include <unixctl_command.h>
 
-#include "lb_clock.h"
+#include "lb.h"
 #include "lb_device.h"
-#include "lb_format.h"
+#include "lb_ip_address.h"
 #include "lb_parser.h"
-#include "lb_scheduler.h"
 #include "lb_service.h"
 
-#define virt_service_key(ip, port, proto)                                      \
-    (((uint64_t)(ip) << 32) | ((uint64_t)(port) << 16) | (uint64_t)(proto))
+#define LB_MAX_VS (64 << 10)
 
-struct lb_vs_table {
-    struct rte_hash *vs_htbl;
-    struct rte_hash *vip_htbl;
+typedef struct {
+    uint64_t as_u64[3];
+} hash_key_24_t;
+
+struct lb_service_main {
+    struct rte_hash *vs_hash;
     rte_rwlock_t rwlock;
-} __rte_cache_aligned;
+};
 
-#define LB_VS_TBL_WLOCK(t) rte_rwlock_write_lock(&(t)->rwlock)
-#define LB_VS_TBL_WUNLOCK(t) rte_rwlock_write_unlock(&(t)->rwlock)
-#define LB_VS_TBL_RLOCK(t) rte_rwlock_read_lock(&(t)->rwlock)
-#define LB_VS_TBL_RUNLOCK(t) rte_rwlock_read_unlock(&(t)->rwlock)
+static struct lb_service_main lb_sm;
 
-#define LB_VS_WLOCK(t) rte_rwlock_write_lock(&(t)->rwlock)
-#define LB_VS_WUNLOCK(t) rte_rwlock_write_unlock(&(t)->rwlock)
-#define LB_VS_RLOCK(t) rte_rwlock_read_lock(&(t)->rwlock)
-#define LB_VS_RUNLOCK(t) rte_rwlock_read_unlock(&(t)->rwlock)
-
-static struct lb_vs_table *lb_vs_tbls[RTE_MAX_NUMA_NODES];
-
-static inline uint32_t
-vs_tbl_get_next(int sid) {
-    sid++;
-    while (sid < RTE_MAX_NUMA_NODES) {
-        if (lb_vs_tbls[sid] == NULL) {
-            sid++;
-            continue;
-        }
-        break;
-    }
-    return sid;
+static inline void
+make_hash_key_24(hash_key_24_t *k, ip46_address_t *ip46, uint16_t port,
+                 lb_proto_t proto) {
+    k->as_u64[0] = ip46->as_u64[0];
+    k->as_u64[1] = ip46->as_u64[1];
+    k->as_u64[2] = (uint64_t)proto << 32 | (uint64_t)port;
 }
 
-#define VS_TBL_FOREACH_SOCKET(socket_id)                                       \
-    for (socket_id = vs_tbl_get_next(-1); socket_id < RTE_MAX_NUMA_NODES;      \
-         socket_id = vs_tbl_get_next(socket_id))
-
 int
-lb_service_init(void) {
-    uint16_t devid;
-    struct lb_device *dev;
-    uint32_t socket_id;
-    char name[RTE_HASH_NAMESIZE];
+lb_service_module_init(void) {
+    struct lb_service_main *m = &lb_sm;
     struct rte_hash_parameters param;
-    struct lb_vs_table *t;
 
-    LB_DEVICE_FOREACH(devid, dev) {
-        socket_id = dev->socket_id;
+    rte_rwlock_init(&m->rwlock);
 
-        if (lb_vs_tbls[socket_id] != NULL)
-            continue;
-        t = rte_zmalloc_socket("lb_vs_table", sizeof(*t), RTE_CACHE_LINE_SIZE,
-                               socket_id);
-        if (t == NULL) {
-            RTE_LOG(ERR, USER1, "%s(): Not enough memory.", __func__);
-            return -1;
-        }
-
-        memset(&param, 0, sizeof(param));
-        snprintf(name, sizeof(name), "vs_htbl%u", socket_id);
-        param.name = name;
-        param.entries = LB_MAX_VS;
-        param.key_len = sizeof(uint64_t);
-        param.socket_id = socket_id;
-        param.hash_func = rte_hash_crc;
-
-        t->vs_htbl = rte_hash_create(&param);
-        if (t->vs_htbl == NULL) {
-            RTE_LOG(ERR, USER1, "%s(): Create hash table %s failed, %s.",
-                    __func__, name, rte_strerror(rte_errno));
-            return -1;
-        }
-
-        memset(&param, 0, sizeof(param));
-        snprintf(name, sizeof(name), "vip_htbl%u", socket_id);
-        param.name = name;
-        param.entries = LB_MAX_VS;
-        param.key_len = sizeof(uint32_t);
-        param.socket_id = socket_id;
-        param.hash_func = rte_hash_crc;
-
-        t->vip_htbl = rte_hash_create(&param);
-        if (t->vip_htbl == NULL) {
-            RTE_LOG(ERR, USER1, "%s(): Create hash table %s failed, %s.",
-                    __func__, name, rte_strerror(rte_errno));
-            return -1;
-        }
-
-        rte_rwlock_init(&t->rwlock);
-
-        lb_vs_tbls[socket_id] = t;
+    memset(&param, 0, sizeof(param));
+    param.name = "VS_HASH";
+    param.entries = LB_MAX_VS;
+    param.key_len = sizeof(hash_key_24_t);
+    param.socket_id = SOCKET_ID_ANY;
+    param.hash_func = rte_hash_crc;
+    if (!(m->vs_hash = rte_hash_create(&param))) {
+        log_err("%s(): Create vs hash table failed, %s\n", __func__,
+                rte_strerror(rte_errno));
+        return -1;
     }
-
     return 0;
 }
 
-int
-lb_is_vip_exist(uint32_t vip) {
-    struct lb_vs_table *t;
-
-    t = lb_vs_tbls[rte_socket_id()];
-    return rte_hash_lookup(t->vip_htbl, &vip) >= 0;
-}
-
 static struct lb_virt_service *
-vs_tbl_find(struct lb_vs_table *t, uint32_t vip, uint16_t vport,
-            uint8_t proto) {
-    struct lb_virt_service *vs = NULL;
-    uint64_t key;
+lb_vs_create(ip46_address_t *vaddr, uint16_t vport, lb_proto_t proto,
+             const char *sched_name) {
+    struct lb_virt_service *vs;
 
-    key = virt_service_key(vip, vport, proto);
-    rte_hash_lookup_data(t->vs_htbl, &key, (void **)&vs);
-
+    if (!(vs = rte_malloc(NULL, sizeof(struct lb_virt_service), 0))) {
+        log_warning("Get vs from mempool failed: %s.", rte_strerror(rte_errno));
+        return NULL;
+    }
+    if (lb_scheduler_init(&vs->sched, sched_name) < 0) {
+        rte_free(vs);
+        return NULL;
+    }
+    ip46_address_copy(&vs->vaddr, vaddr);
+    vs->vport = vport;
+    vs->proto = proto;
+    vs->flags = 0;
+    rte_atomic32_set(&vs->refcnt, 1);
+    rte_atomic32_set(&vs->active_conns, 0);
+    rte_rwlock_init(&vs->rwlock);
+    LIST_INIT(&vs->real_services);
+    vs->est_timeout = 0;
+    vs->max_conns = INT32_MAX;
     return vs;
 }
 
-static int
-vs_tbl_add(struct lb_vs_table *t, struct lb_virt_service *vs) {
-    uint64_t key;
-    int rc;
-    void *p;
-    uint32_t count = 0;
-
-    key = virt_service_key(vs->vip, vs->vport, vs->proto);
-    rc = rte_hash_add_key_data(t->vs_htbl, &key, vs);
-    if (rc < 0) {
-        return rc;
-    }
-
-    rc = rte_hash_lookup_data(t->vip_htbl, &vs->vip, &p);
-    if (rc == 0) {
-        count = (uint32_t)(uintptr_t)p;
-    }
-    count += 1;
-
-    rc = rte_hash_add_key_data(t->vip_htbl, &vs->vip, (void *)(uintptr_t)count);
-    if (unlikely(rc < 0)) {
-        rte_hash_del_key(t->vs_htbl, &key);
-    }
-
-    return rc;
-}
-
 static void
-vs_tbl_del(struct lb_vs_table *t, struct lb_virt_service *vs) {
-    uint64_t key;
-    int rc;
-    void *p;
-    uint32_t count;
+lb_sched_node_init(struct lb_sched_node *node, ip46_address_t *raddr,
+                   uint16_t rport, int weight) {
+    char ident[LB_SCHED_NODE_IDEN_MAX];
 
-    key = virt_service_key(vs->vip, vs->vport, vs->proto);
-    rc = rte_hash_del_key(t->vs_htbl, &key);
-    if (rc < 0) {
-        return;
-    }
-
-    rc = rte_hash_lookup_data(t->vip_htbl, &vs->vip, &p);
-    if (unlikely(rc < 0)) {
-        return;
-    }
-
-    count = (uint32_t)(uintptr_t)p;
-    count -= 1;
-    if (count == 0) {
-        rte_hash_del_key(t->vip_htbl, &key);
-    } else {
-        rte_hash_add_key_data(t->vip_htbl, &vs->vip, (void *)(uintptr_t)count);
-    }
+    node->weight = weight;
+    if (ip46_address_is_ip4(raddr))
+        snprintf(ident, LB_SCHED_NODE_IDEN_MAX, IPv4_BYTES_FMT "%d",
+                 IPv4_BYTES(raddr->ip4.as_u32), rport);
+    else
+        snprintf(ident, LB_SCHED_NODE_IDEN_MAX, IPv6_BYTES_FMT "%d",
+                 IPv6_BYTES(raddr->ip6.as_u8), rport);
+    strncpy(node->ident, ident, LB_SCHED_NODE_IDEN_MAX);
 }
 
 static struct lb_real_service *
-vs_find_rs(struct lb_virt_service *vs, uint32_t rip, uint16_t rport) {
+lb_rs_create(ip46_address_t *raddr, uint16_t rport, int weight,
+             struct lb_virt_service *vs) {
     struct lb_real_service *rs;
 
-    LIST_FOREACH(rs, &vs->real_services, next) {
-        if (rs->rip == rip && rs->rport == rport)
-            return rs;
+    if (!(rs = rte_malloc(NULL, sizeof(struct lb_real_service), 0))) {
+        log_warning("alloc real service failed: %s.", rte_strerror(rte_errno));
+        return NULL;
     }
-    return NULL;
+    lb_sched_node_init(&rs->sched_node, raddr, rport, weight);
+    ip46_address_copy(&rs->raddr, raddr);
+    rs->rport = rport;
+    rs->virt_service = vs;
+    rs->flags = 0;
+    rte_atomic32_set(&vs->refcnt, 1);
+    rte_atomic32_set(&vs->active_conns, 0);
+    return rs;
 }
 
-static void
-lb_rs_list_insert_by_weight(struct lb_virt_service *vs,
-                            struct lb_real_service *rs) {
-    struct lb_real_service *real_service;
+static inline struct lb_virt_service *
+lb_vs_table_lookup_inline(ip46_address_t *vaddr, uint16_t vport,
+                          lb_proto_t proto) {
+    struct lb_service_main *m = &lb_sm;
+    hash_key_24_t _k, *k = &_k;
+    struct lb_virt_service *vs;
 
-    if (LIST_EMPTY(&vs->real_services)) {
-        LIST_INSERT_HEAD(&vs->real_services, rs, next);
-        return;
-    }
-
-    LIST_FOREACH(real_service, &vs->real_services, next) {
-        if (LIST_NEXT(real_service, next) == NULL)
-            break;
-        if (real_service->weight <= rs->weight)
-            break;
-    }
-
-    if (real_service->weight <= rs->weight)
-        LIST_INSERT_BEFORE(real_service, rs, next);
-    else
-        LIST_INSERT_AFTER(real_service, rs, next);
+    make_hash_key_24(k, vaddr, vport, proto);
+    if (rte_hash_lookup_data(m->vs_hash, k, (void **)&vs) < 0)
+        return NULL;
+    return vs;
 }
 
-static void
-lb_rs_list_update_by_weight(struct lb_virt_service *vs,
-                            struct lb_real_service *rs) {
-    LIST_REMOVE(rs, next);
-    lb_rs_list_insert_by_weight(vs, rs);
+static inline int
+lb_vs_table_add_inline(struct lb_virt_service *vs) {
+    struct lb_service_main *m = &lb_sm;
+    hash_key_24_t _k, *k = &_k;
+
+    make_hash_key_24(k, &vs->vaddr, vs->vport, vs->proto);
+    rte_rwlock_write_lock(&m->rwlock);
+    if (rte_hash_add_key_data(m->vs_hash, k, vs) < 0) {
+        rte_rwlock_write_unlock(&m->rwlock);
+        return -1;
+    }
+    rte_rwlock_write_unlock(&m->rwlock);
+    return 0;
+}
+
+static inline void
+lb_vs_table_del_inline(struct lb_virt_service *vs) {
+    struct lb_service_main *m = &lb_sm;
+    hash_key_24_t _k, *k = &_k;
+
+    make_hash_key_24(k, &vs->vaddr, vs->vport, vs->proto);
+    rte_rwlock_write_lock(&m->rwlock);
+    rte_hash_del_key(m->vs_hash, k);
+    rte_rwlock_write_unlock(&m->rwlock);
 }
 
 struct lb_virt_service *
-lb_vs_get(uint32_t vip, uint16_t vport, uint8_t proto) {
-    uint32_t socket_id = rte_socket_id();
+lb_vs_get(void *ip, uint16_t vport, lb_proto_t proto, uint8_t is_ip4) {
+    ip46_address_t ip46;
+    hash_key_24_t _k, *k = &_k;
+    struct lb_service_main *m = &lb_sm;
     struct lb_virt_service *vs;
 
-    LB_VS_TBL_RLOCK(lb_vs_tbls[socket_id]);
-    vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-    if (vs != NULL) {
-        rte_atomic32_add(&vs->refcnt, 1);
-    }
-    LB_VS_TBL_RUNLOCK(lb_vs_tbls[socket_id]);
+    if (is_ip4)
+        ip46_address_set_ip4(&ip46, (ip4_address_t *)ip);
+    else
+        ip46_address_set_ip6(&ip46, (ip6_address_t *)ip);
+    make_hash_key_24(k, &ip46, vport, proto);
 
+    rte_rwlock_read_lock(&m->rwlock);
+    if (rte_hash_lookup_data(m->vs_hash, k, (void **)&vs) < 0) {
+        rte_rwlock_read_unlock(&m->rwlock);
+        return NULL;
+    }
+    if (rte_atomic32_read(&vs->active_conns) >= vs->max_conns) {
+        rte_rwlock_read_unlock(&m->rwlock);
+        return NULL;
+    }
+    rte_atomic32_inc(&vs->refcnt);
+    rte_rwlock_read_unlock(&m->rwlock);
     return vs;
 }
 
 void
 lb_vs_put(struct lb_virt_service *vs) {
-    lb_vs_free(vs);
+    if (vs && rte_atomic32_add_return(&vs->refcnt, -1) == 0) {
+        lb_scheduler_uninit(&vs->sched);
+        rte_free(vs);
+    }
+}
+
+static inline struct lb_real_service *
+lb_rs_table_lookup_inline(struct lb_virt_service *vs, ip46_address_t *raddr,
+                          uint16_t rport) {
+    struct lb_real_service *rs;
+
+    LIST_FOREACH(rs, &vs->real_services, next) {
+        if ((rs->rport == rport) && (ip46_address_cmp(&rs->raddr, raddr) == 0))
+            return rs;
+    }
+    return NULL;
+}
+
+static inline void
+lb_rs_table_del_inline(struct lb_virt_service *vs, struct lb_real_service *rs) {
+    (void)vs;
+    LIST_REMOVE(rs, next);
+}
+
+static inline void
+lb_rs_table_add_inline(struct lb_virt_service *vs, struct lb_real_service *rs) {
+    LIST_INSERT_HEAD(&vs->real_services, rs, next);
 }
 
 struct lb_real_service *
-lb_vs_get_rs(struct lb_virt_service *vs, uint32_t cip, uint16_t cport) {
-    struct lb_real_service *rs;
+lb_vs_get_rs(struct lb_virt_service *vs, void *caddr, uint16_t cport,
+             uint8_t is_ip4) {
+    struct lb_sched_node *node;
 
-    LB_VS_RLOCK(vs);
-    rs = vs->sched->dispatch(vs, cip, cport);
-    if (rs != NULL) {
-        rte_atomic32_add(&rs->refcnt, 1);
-    }
-    LB_VS_RUNLOCK(vs);
-
-    return rs;
-}
-
-void
-lb_vs_put_rs(struct lb_real_service *rs) {
-    lb_rs_free(rs);
-}
-
-static struct lb_virt_service *
-lb_vs_alloc(uint32_t vip, uint16_t vport, uint8_t proto,
-            const struct lb_scheduler *sched, uint32_t socket_id) {
-    struct lb_virt_service *vs;
-
-    vs = rte_zmalloc_socket("vs", sizeof(*vs), RTE_CACHE_LINE_SIZE, socket_id);
-    if (vs == NULL)
-        return NULL;
-
-    if (sched->init && sched->init(vs) < 0) {
-        rte_free(vs);
+    rte_rwlock_read_lock(&vs->rwlock);
+    node = lb_scheduler_dispatch(&vs->sched, caddr, cport, is_ip4);
+    if (!node) {
+        rte_rwlock_read_unlock(&vs->rwlock);
         return NULL;
     }
-
-    vs->vip = vip;
-    vs->vport = vport;
-    vs->proto = proto;
-    vs->sched = sched;
-    vs->max_conns = INT32_MAX;
-    vs->socket_id = socket_id;
-    rte_atomic32_set(&vs->refcnt, 1);
-
-    return vs;
+    rte_rwlock_read_unlock(&vs->rwlock);
+    return (struct lb_real_service *)node;
 }
 
 void
-lb_vs_free(struct lb_virt_service *vs) {
-    if (vs == NULL)
-        return;
-
-    if (rte_atomic32_add_return(&vs->refcnt, -1) != 0)
-        return;
-    if (vs->sched->fini)
-        vs->sched->fini(vs);
-    rte_free(vs);
+lb_rs_put(struct lb_real_service *rs) {
+    if (rs && rte_atomic32_add_return(&rs->refcnt, -1) == 0) {
+        lb_vs_put(rs->virt_service);
+        rte_free(rs);
+    }
 }
 
-static struct lb_real_service *
-lb_rs_alloc(uint32_t rip, uint32_t rport, int weight,
-            struct lb_virt_service *vs) {
-    struct lb_real_service *rs;
+static int
+lb_rs_sched_enable(struct lb_real_service *rs, uint8_t is_enable) {
+    struct lb_virt_service *vs = rs->virt_service;
 
-    rs = rte_zmalloc_socket("rs", sizeof(*rs), RTE_CACHE_LINE_SIZE,
-                            vs->socket_id);
-    if (rs == NULL)
-        return NULL;
-
-    rs->rip = rip;
-    rs->rport = rport;
-    rs->proto = vs->proto;
-    rs->weight = weight;
-    rs->virt_service = vs;
-    rte_atomic32_add(&vs->refcnt, 1);
-    rte_atomic32_set(&rs->refcnt, 1);
-
-    return rs;
-}
-
-void
-lb_rs_free(struct lb_real_service *rs) {
-    if (rs == NULL)
-        return;
-    if (rte_atomic32_add_return(&rs->refcnt, -1) != 0)
-        return;
-    lb_vs_free(rs->virt_service);
-    rte_free(rs);
+    if (is_enable) {
+        if (rs->flags & LB_RS_F_AVAILABLE)
+            return 0;
+        rte_rwlock_write_lock(&vs->rwlock);
+        if (lb_scheduler_add_node(&vs->sched, &rs->sched_node) < 0) {
+            rte_rwlock_write_unlock(&vs->rwlock);
+            return -1;
+        }
+        rs->flags |= LB_RS_F_AVAILABLE;
+        rte_rwlock_write_unlock(&vs->rwlock);
+    } else {
+        if (!(rs->flags & LB_RS_F_AVAILABLE))
+            return 0;
+        rte_rwlock_write_lock(&vs->rwlock);
+        if (lb_scheduler_del_node(&vs->sched, &rs->sched_node) < 0) {
+            rte_rwlock_write_unlock(&vs->rwlock);
+            return -1;
+        }
+        rs->flags &= ~LB_RS_F_AVAILABLE;
+        rte_rwlock_write_unlock(&vs->rwlock);
+    }
+    return 0;
 }
 
 static void
-vs_del_all_rs(struct lb_virt_service *vs) {
-    struct lb_real_service *rs;
+lb_rs_update_weight(struct lb_real_service *rs, int weight) {
+    struct lb_virt_service *vs = rs->virt_service;
 
-    while ((rs = LIST_FIRST(&vs->real_services)) != NULL) {
-        LIST_REMOVE(rs, next);
-        vs->sched->del(vs, rs);
-        lb_rs_free(rs);
+    if (!(rs->flags & LB_RS_F_AVAILABLE)) {
+        rs->sched_node.weight = weight;
+    } else {
+        rte_rwlock_write_lock(&vs->rwlock);
+        rs->sched_node.weight = weight;
+        lb_scheduler_del_node(&vs->sched, &rs->sched_node);
+        if (lb_scheduler_add_node(&vs->sched, &rs->sched_node) < 0) {
+            rs->flags &= ~LB_RS_F_AVAILABLE;
+        }
+        rte_rwlock_write_unlock(&vs->rwlock);
     }
 }
 
-/* UNIXCTL COMMAND */
+static int
+lb_vs_update_sched(struct lb_virt_service *vs, const char *new_sched_name) {
+    char old_sched_name[LB_SCHED_NAMESIZE];
+    struct lb_real_service *rs;
+
+    strcpy(old_sched_name, vs->sched.name);
+    if (strcmp(old_sched_name, new_sched_name) == 0)
+        return 0;
+    rte_rwlock_write_lock(&vs->rwlock);
+    LIST_FOREACH(rs, &vs->real_services, next) {
+        if (rs->flags & LB_RS_F_AVAILABLE)
+            lb_scheduler_del_node(&vs->sched, &rs->sched_node);
+    }
+    lb_scheduler_uninit(&vs->sched);
+    if (lb_scheduler_init(&vs->sched, new_sched_name) < 0) {
+        goto recovery;
+    }
+    LIST_FOREACH(rs, &vs->real_services, next) {
+        if ((rs->flags & LB_RS_F_AVAILABLE) &&
+            lb_scheduler_add_node(&vs->sched, &rs->sched_node) < 0) {
+            rs->flags &= ~LB_RS_F_AVAILABLE;
+        }
+    }
+    rte_rwlock_write_unlock(&vs->rwlock);
+    return 0;
+
+recovery:
+    if (lb_scheduler_init(&vs->sched, old_sched_name) < 0) {
+        LIST_FOREACH(rs, &vs->real_services, next) {
+            rs->flags &= ~LB_RS_F_AVAILABLE;
+        }
+        rte_rwlock_write_unlock(&vs->rwlock);
+        return -1;
+    }
+    LIST_FOREACH(rs, &vs->real_services, next) {
+        if ((rs->flags & LB_RS_F_AVAILABLE) &&
+            lb_scheduler_add_node(&vs->sched, &rs->sched_node) < 0) {
+            rs->flags &= ~LB_RS_F_AVAILABLE;
+        }
+    }
+    rte_rwlock_write_unlock(&vs->rwlock);
+    return 0;
+}
+
+/* unixctl commands */
+
+static inline int
+parse_l4_proto(const char *token, lb_proto_t *proto) {
+    if (strcasecmp(token, "tcp") == 0) {
+        *proto = LB_PROTO_TCP;
+        return 0;
+    }
+    if (strcasecmp(token, "udp") == 0) {
+        *proto = LB_PROTO_UDP;
+        return 0;
+    }
+    *proto = LB_PROTO_MAX;
+    return -1;
+}
 
 static int
-vs_add_arg_parse(char *argv[], __attribute((unused)) int argc, uint32_t *vip,
-                 uint16_t *vport, uint8_t *proto,
-                 const struct lb_scheduler **sched) {
+parse_ip46_address(const char *token, ip46_address_t *ip46) {
+    struct in_addr in;
+    struct in6_addr in6;
+
+    if (parse_ipv4_addr(token, &in) == 0) {
+        ip46_address_set_ip4(ip46, (ip4_address_t *)&in);
+        return 0;
+    }
+    if (parse_ipv6_addr(token, &in6) == 0) {
+        ip46_address_set_ip6(ip46, (ip6_address_t *)&in6);
+        return 0;
+    }
+    return -1;
+}
+
+static int
+parse_l4_port(const char *token, uint16_t *port) {
+    if (parser_read_uint16(port, token) < 0) {
+        return -1;
+    }
+    *port = htons(*port);
+    return 0;
+}
+
+static int
+parse_sched_name(const char *token, char sched_name[]) {
+    if ((strcasecmp(token, "ipport") == 0) ||
+        (strcasecmp(token, "iponly") == 0) || (strcasecmp(token, "rr") == 0) ||
+        (strcasecmp(token, "wrr") == 0)) {
+        snprintf(sched_name, LB_SCHED_NAMESIZE, "%s", token);
+        return 0;
+    }
+    return -1;
+}
+
+static int
+vs_add_arg_parse(char *argv[], __attribute((unused)) int argc,
+                 ip46_address_t *vip, uint16_t *vport, lb_proto_t *proto,
+                 char sched_name[]) {
     int i = 0;
-    int rc;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    /* scheduler */
-    rc = lb_scheduler_lookup_by_name(argv[i++], sched);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
+    if (parse_sched_name(argv[i++], sched_name) < 0) {
+        return i - 1;
+    }
     return i;
 }
 
 static void
 vs_add_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vaddr;
     uint16_t vport;
-    uint8_t proto;
-    const struct lb_scheduler *sched;
+    lb_proto_t proto = LB_PROTO_MAX;
+    char sched_name[LB_SCHED_NAMESIZE];
+    struct lb_virt_service *vs;
     int rc;
-    struct lb_virt_service *vss[RTE_MAX_NUMA_NODES] = {0};
-    uint32_t socket_id;
 
-    memset(vss, 0, sizeof(vss));
-
-    rc = vs_add_arg_parse(argv, argc, &vip, &vport, &proto, &sched);
+    rc = vs_add_arg_parse(argv, argc, &vaddr, &vport, &proto, sched_name);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        if (vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto) != NULL) {
-            unixctl_command_reply_error(fd, "Virt service already exists.\n");
-            goto free_vss;
-        }
-
-        vss[socket_id] = lb_vs_alloc(vip, vport, proto, sched, socket_id);
-        if (vss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Not enough memory.\n");
-            goto free_vss;
-        }
+    if (lb_vs_table_lookup_inline(&vaddr, vport, proto)) {
+        unixctl_command_reply_error(fd, "virt service is exised.");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        LB_VS_TBL_WLOCK(lb_vs_tbls[socket_id]);
-        rc = vs_tbl_add(lb_vs_tbls[socket_id], vss[socket_id]);
-        LB_VS_TBL_WUNLOCK(lb_vs_tbls[socket_id]);
-        if (rc < 0) {
-            unixctl_command_reply_error(fd, "No space in the table.\n");
-            goto del_vss;
-        }
+    if (!(vs = lb_vs_create(&vaddr, vport, proto, sched_name))) {
+        unixctl_command_reply_error(fd, "Cannot create virt service.");
+        return;
     }
-
-    return;
-
-del_vss:
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        LB_VS_TBL_WLOCK(lb_vs_tbls[socket_id]);
-        vs_tbl_del(lb_vs_tbls[socket_id], vss[socket_id]);
-        LB_VS_TBL_WUNLOCK(lb_vs_tbls[socket_id]);
+    if (lb_vs_table_add_inline(vs) < 0) {
+        lb_vs_put(vs);
+        unixctl_command_reply_error(
+            fd, "Insert virt service to hash table failed.");
+        return;
     }
-
-free_vss:
-    VS_TBL_FOREACH_SOCKET(socket_id) { lb_vs_free(vss[socket_id]); }
+    if (lb_device_add_vip_lip(lb_device_get_outbound(), &vaddr) < 0) {
+        lb_vs_table_del_inline(vs);
+        lb_vs_put(vs);
+        unixctl_command_reply_error(fd, "Insert vip to hash table failed.");
+    }
 }
 
-UNIXCTL_CMD_REGISTER("vs/add", "VIP:VPORT tcp|udp ipport|iponly|rr|wrr.",
-                     "Add virtual service.", 3, 3, vs_add_cmd_cb);
+UNIXCTL_CMD_REGISTER("vs/add", "VIP VPORT tcp|udp ipport|iponly|rr|wrr.",
+                     "Add virtual service.", 4, 4, vs_add_cmd_cb);
 
 static int
-vs_del_arg_parse(char *argv[], __attribute((unused)) int argc, uint32_t *vip,
-                 uint16_t *vport, uint8_t *proto) {
-    int rc;
+vs_del_arg_parse(char *argv[], __attribute((unused)) int argc,
+                 ip46_address_t *vip, uint16_t *vport, lb_proto_t *proto) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
     return i;
 }
 
 static void
 vs_del_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     int rc;
-    uint32_t socket_id;
     struct lb_virt_service *vs;
+    struct lb_real_service *rs;
 
     rc = vs_del_arg_parse(argv, argc, &vip, &vport, &proto);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs != NULL) {
-            LB_VS_WLOCK(vs);
-            vs_del_all_rs(vs);
-            LB_VS_WUNLOCK(vs);
-
-            LB_VS_TBL_WLOCK(lb_vs_tbls[socket_id]);
-            vs_tbl_del(lb_vs_tbls[socket_id], vs);
-            LB_VS_TBL_WUNLOCK(lb_vs_tbls[socket_id]);
-
-            lb_vs_free(vs);
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.");
+        return;
     }
+    while ((rs = LIST_FIRST(&vs->real_services)) != NULL) {
+        LIST_REMOVE(rs, next);
+        lb_rs_sched_enable(rs, 0);
+        lb_rs_put(rs);
+    }
+    lb_vs_table_del_inline(vs);
+    lb_vs_put(vs);
+    lb_device_del_vip_lip(lb_device_get_inbound(), &vip);
 }
 
-UNIXCTL_CMD_REGISTER("vs/del", "VIP:VPORT tcp|udp.", "Delete virtual service.",
-                     2, 2, vs_del_cmd_cb);
-
-static inline const char *
-l4proto_format(uint8_t l4proto) {
-    if (l4proto == IPPROTO_TCP)
-        return "tcp";
-    if (l4proto == IPPROTO_UDP)
-        return "udp";
-    return "oth";
-}
+UNIXCTL_CMD_REGISTER("vs/del", "VIP VPORT tcp|udp.", "Delete virtual service.",
+                     3, 3, vs_del_cmd_cb);
 
 static int
 vs_list_arg_parse(char *argv[], int argc, int *json_fmt) {
     int i = 0;
-    int rc;
 
-    if (i < argc) {
-        rc = strcmp(argv[i++], "--json");
-        if (rc != 0)
-            return i - 1;
-        *json_fmt = 1;
-    } else {
+    if (i == argc) {
         *json_fmt = 0;
+        return i;
     }
+    if (strcmp(argv[i++], "--json") == 0) {
+        *json_fmt = 1;
+        return i;
+    } else {
+        return i - 1;
+    }
+}
 
-    return i;
+static inline const char *
+l4proto_format(lb_proto_t proto) {
+    if (proto == LB_PROTO_TCP)
+        return "tcp";
+    if (proto == LB_PROTO_UDP)
+        return "udp";
+    return "oth";
 }
 
 static void
 vs_list_cmd_cb(int fd, char *argv[], int argc) {
-    int json_fmt, json_first_obj = 1;
+    struct lb_service_main *m = &lb_sm;
+    int json_fmt;
     int rc;
-    uint32_t socket_id;
-    struct lb_vs_table *t = NULL;
     const void *key;
     uint32_t next = 0;
     struct lb_virt_service *vs;
-    char buf[32];
+    char buf[INET6_ADDRSTRLEN];
 
     rc = vs_list_arg_parse(argv, argc, &json_fmt);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        static const char *vs_list_header =
-            "IP               Port   Type   Sched       Max_conns   synproxy  "
-            "toa  est_timeout\n";
-        t = lb_vs_tbls[socket_id];
-
-        unixctl_command_reply(fd, json_fmt ? "[" : vs_list_header);
-        while (rte_hash_iterate(t->vs_htbl, &key, (void **)&vs, &next) >= 0) {
-            ipv4_addr_tostring(vs->vip, buf, sizeof(buf));
-
-            if (json_fmt) {
-                unixctl_command_reply(fd, json_first_obj ? "{" : ",{");
-                json_first_obj = 0;
-                unixctl_command_reply(fd, JSON_KV_S_FMT("ip", ","), buf);
-                unixctl_command_reply(fd, JSON_KV_32_FMT("port", ","),
-                                      rte_be_to_cpu_16(vs->vport));
-                unixctl_command_reply(fd, JSON_KV_S_FMT("type", ","),
-                                      l4proto_format(vs->proto));
-                unixctl_command_reply(fd, JSON_KV_S_FMT("sched", ","),
-                                      vs->sched->name);
-                unixctl_command_reply(fd, JSON_KV_32_FMT("max_conns", ","),
-                                      vs->max_conns);
-                unixctl_command_reply(fd, JSON_KV_32_FMT("synproxy", ","),
-                                      !!(vs->flags & LB_VS_F_SYNPROXY));
-                unixctl_command_reply(fd, JSON_KV_32_FMT("toa", ","),
-                                      !!(vs->flags & LB_VS_F_TOA));
-                unixctl_command_reply(fd, JSON_KV_32_FMT("est_timeout", "}"),
-                                      vs->est_timeout);
-            } else {
-                unixctl_command_reply(
-                    fd, "%-15s  %-5u  %-5s  %-10s  %-10d  %-8u  %-3u  %-10u\n",
-                    buf, rte_be_to_cpu_16(vs->vport), l4proto_format(vs->proto),
-                    vs->sched->name, vs->max_conns,
-                    !!(vs->flags & LB_VS_F_SYNPROXY),
-                    !!(vs->flags & LB_VS_F_TOA), vs->est_timeout);
-            }
+    if (json_fmt) {
+        cJSON *array = cJSON_CreateArray();
+        if (!array)
+            return;
+        while (rte_hash_iterate(m->vs_hash, &key, (void **)&vs, &next) >= 0) {
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "ip",
+                                    ip46_address_format(&vs->vaddr, buf));
+            cJSON_AddNumberToObject(obj, "port", rte_be_to_cpu_16(vs->vport));
+            cJSON_AddStringToObject(obj, "type", l4proto_format(vs->proto));
+            cJSON_AddStringToObject(obj, "sched", vs->sched.name);
+            cJSON_AddNumberToObject(obj, "max_conns", vs->max_conns);
+            cJSON_AddNumberToObject(obj, "synproxy",
+                                    !!(vs->flags & LB_VS_F_SYNPROXY));
+            cJSON_AddNumberToObject(obj, "toa", !!(vs->flags & LB_VS_F_TOA));
+            cJSON_AddNumberToObject(obj, "est_timeout", vs->est_timeout);
+            cJSON_AddNumberToObject(obj, "refcnt",
+                                    rte_atomic32_read(&vs->refcnt));
+            cJSON_AddNumberToObject(obj, "active_conns",
+                                    rte_atomic32_read(&vs->active_conns));
+            cJSON_AddItemToArray(array, obj);
         }
-        if (json_fmt)
-            unixctl_command_reply(fd, "]\n");
-
-        break;
+        char *str = cJSON_PrintUnformatted(array);
+        unixctl_command_reply_string(fd, str);
+        cJSON_free(str);
+        cJSON_Delete(array);
+    } else {
+        unixctl_command_reply(
+            fd, "%-45s  %-5s  %-5s  %-10s  %-10s  %-8s  %-3s  %-10s\n", "IP",
+            "Port", "Type", "Sched", "Max_conns", "Synproxy", "Toa",
+            "Conn_timeout");
+        while (rte_hash_iterate(m->vs_hash, &key, (void **)&vs, &next) >= 0) {
+            unixctl_command_reply(
+                fd, "%-45s  %-5u  %-5s  %-10s  %-10d  %-8u  %-3u  %-10u\n",
+                ip46_address_format(&vs->vaddr, buf),
+                rte_be_to_cpu_16(vs->vport), l4proto_format(vs->proto),
+                vs->sched.name, vs->max_conns, !!(vs->flags & LB_VS_F_SYNPROXY),
+                !!(vs->flags & LB_VS_F_TOA), vs->est_timeout);
+        }
     }
 }
 UNIXCTL_CMD_REGISTER("vs/list", "[--json].", "List all virtual services.", 0, 1,
                      vs_list_cmd_cb);
 
 static int
-vs_synproxy_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                      uint8_t *proto, uint8_t *echo, uint8_t *op) {
-    int rc;
+vs_flags_arg_parse(char *argv[], int argc, ip46_address_t *vip, uint16_t *vport,
+                   lb_proto_t *proto, uint8_t *echo, uint8_t *op) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0 || *proto != IPPROTO_TCP)
+    }
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
-
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0 || *proto != LB_PROTO_TCP) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
-        rc = parser_read_uint8(op, argv[i++]);
-        if (rc < 0)
+        if (parser_read_uint8(op, argv[i++]) < 0) {
             return i - 1;
+        }
     } else {
         *echo = 1;
+        *op = 0;
     }
 
     return i;
@@ -610,508 +598,378 @@ vs_synproxy_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
 
 static void
 vs_synproxy_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
     uint8_t op;
     int rc;
     struct lb_virt_service *vs;
-    uint32_t socket_id;
 
-    rc = vs_synproxy_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &op);
+    rc = vs_flags_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &op);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%u\n", !!(vs->flags & LB_VS_F_SYNPROXY));
-            return;
-        }
-
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%u\n", !!(vs->flags & LB_VS_F_SYNPROXY));
+    } else {
         if (op) {
             vs->flags |= LB_VS_F_SYNPROXY;
         } else {
             vs->flags &= ~LB_VS_F_SYNPROXY;
         }
     }
-
-    return;
 }
 
-UNIXCTL_CMD_REGISTER("vs/synproxy", "VIP:VPORT tcp [0|1].",
-                     "Show or set synproxy.", 2, 3, vs_synproxy_cmd_cb);
-
-static int
-vs_toa_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                 uint8_t *proto, uint8_t *echo, uint8_t *op) {
-    int rc;
-    int i = 0;
-
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
-        return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0 || *proto != IPPROTO_TCP)
-        return i - 1;
-
-    if (i < argc) {
-        *echo = 0;
-        rc = parser_read_uint8(op, argv[i++]);
-        if (rc < 0)
-            return i - 1;
-    } else {
-        *echo = 1;
-    }
-
-    return i;
-}
+UNIXCTL_CMD_REGISTER("vs/synproxy", "VIP VPORT tcp [0|1].",
+                     "Show or set synproxy.", 3, 4, vs_synproxy_cmd_cb);
 
 static void
 vs_toa_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
     uint8_t op;
     int rc;
     struct lb_virt_service *vs;
-    uint32_t socket_id;
 
-    rc = vs_toa_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &op);
+    rc = vs_flags_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &op);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%u\n", !!(vs->flags & LB_VS_F_TOA));
-            return;
-        }
-
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%u\n", !!(vs->flags & LB_VS_F_TOA));
+    } else {
         if (op) {
             vs->flags |= LB_VS_F_TOA;
         } else {
             vs->flags &= ~LB_VS_F_TOA;
         }
     }
-
-    return;
 }
 
-UNIXCTL_CMD_REGISTER("vs/toa", "VIP:VPORT tcp [0|1].", "Show or set toa.", 2, 3,
+UNIXCTL_CMD_REGISTER("vs/toa", "VIP VPORT tcp [0|1].", "Show or set toa.", 3, 4,
                      vs_toa_cmd_cb);
 
 static int
-vs_max_conn_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                      uint8_t *proto, uint8_t *echo, int *max) {
-    int rc;
+vs_max_conn_arg_parse(char *argv[], int argc, ip46_address_t *vip,
+                      uint16_t *vport, lb_proto_t *proto, uint8_t *echo,
+                      int *max) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0)
+    }
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
-
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
-        rc = parser_read_int32(max, argv[i++]);
-        if (rc < 0 || *max < 0)
+        if (parser_read_int32(max, argv[i++]) < 0 || *max < 0) {
             return i - 1;
+        }
     } else {
         *echo = 1;
+        *max = 0;
     }
-
     return i;
 }
 
 static void
 vs_max_conn_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
     int max;
     int rc;
     struct lb_virt_service *vs;
-    uint32_t socket_id;
 
     rc = vs_max_conn_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &max);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%d\n", vs->max_conns);
-            return;
-        }
-
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%d\n", vs->max_conns);
+    } else {
         vs->max_conns = max;
     }
-
-    return;
 }
 
-UNIXCTL_CMD_REGISTER("vs/max_conns", "VIP:VPORT tcp [0|1].",
-                     "Show or set max_conns.", 2, 3, vs_max_conn_cmd_cb);
+UNIXCTL_CMD_REGISTER("vs/max_conns", "VIP VPORT tcp [0|1].",
+                     "Show or set max_conns.", 3, 4, vs_max_conn_cmd_cb);
 
 static int
-vs_est_timeout_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                         uint8_t *proto, uint8_t *echo, uint32_t *timeout) {
-    int rc;
+vs_conn_timeout_arg_parse(char *argv[], int argc, ip46_address_t *vip,
+                          uint16_t *vport, lb_proto_t *proto, uint8_t *echo,
+                          uint32_t *timeout) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0)
+    }
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
-
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
-        rc = parser_read_uint32(timeout, argv[i++]);
-        if (rc < 0)
+        if (parser_read_uint32(timeout, argv[i++]) < 0) {
             return i - 1;
+        }
     } else {
         *echo = 1;
+        *timeout = 0;
     }
-
     return i;
 }
 
 static void
-vs_est_timeout_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+vs_conn_timeout_cmd_cb(int fd, char *argv[], int argc) {
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
     uint32_t timeout;
     int rc;
     struct lb_virt_service *vs;
-    uint32_t socket_id;
 
-    rc = vs_est_timeout_arg_parse(argv, argc, &vip, &vport, &proto, &echo,
-                                  &timeout);
+    rc = vs_conn_timeout_arg_parse(argv, argc, &vip, &vport, &proto, &echo,
+                                   &timeout);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%u\n", LB_CLOCK_TO_SEC(vs->est_timeout));
-            return;
-        }
-        vs->est_timeout = SEC_TO_LB_CLOCK(timeout);
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%u\n", vs->est_timeout / MS_PER_S);
+    } else {
+        vs->est_timeout = timeout * MS_PER_S;
     }
 }
 
-UNIXCTL_CMD_REGISTER("vs/est_timeout", "VIP:VPORT tcp|udp [SEC].",
-                     "Show or set TCP established timeout.", 2, 3,
-                     vs_est_timeout_cmd_cb);
+UNIXCTL_CMD_REGISTER("vs/est_timeout", "VIP VPORT tcp|udp [SEC].",
+                     "Show or set connection timeout.", 3, 4,
+                     vs_conn_timeout_cmd_cb);
 
 static int
-vs_scheduler_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                       uint8_t *proto, uint8_t *echo,
-                       const struct lb_scheduler **sched) {
-    int rc;
+vs_scheduler_arg_parse(char *argv[], int argc, ip46_address_t *vip,
+                       uint16_t *vport, lb_proto_t *proto, uint8_t *echo,
+                       char sched_name[]) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0)
+    }
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
-
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
-        rc = lb_scheduler_lookup_by_name(argv[i++], sched);
-        if (rc < 0) {
+        if (parse_sched_name(argv[i++], sched_name) < 0) {
             return i - 1;
         }
     } else {
         *echo = 1;
     }
-
     return i;
 }
 
 static void
 vs_scheduler_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
-    const struct lb_scheduler *sched;
+    char sched_name[LB_SCHED_NAMESIZE];
     int rc;
     struct lb_virt_service *vs;
-    struct lb_real_service *rs;
-    uint32_t socket_id;
 
-    rc =
-        vs_scheduler_arg_parse(argv, argc, &vip, &vport, &proto, &echo, &sched);
+    rc = vs_scheduler_arg_parse(argv, argc, &vip, &vport, &proto, &echo,
+                                sched_name);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%s\n", vs->sched.name);
+        return;
+    }
 
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%s\n", vs->sched->name);
-            return;
-        }
-
-        if (sched == vs->sched)
-            break;
-
-        LB_VS_WLOCK(vs);
-        LIST_FOREACH(rs, &vs->real_services, next) {
-            if (rs->flags & LB_RS_F_AVAILABLE)
-                vs->sched->del(vs, rs);
-        }
-        if (vs->sched->fini)
-            vs->sched->fini(vs);
-
-        vs->sched = sched;
-        if (vs->sched->init && vs->sched->init(vs) < 0) {
-            LIST_FOREACH(rs, &vs->real_services, next) {
-                rs->flags &= ~LB_RS_F_AVAILABLE;
-            }
-            LB_VS_WUNLOCK(vs);
-            unixctl_command_reply_error(fd, "Cannot init scheduler %s.\n",
-                                        sched->name);
-            return;
-        }
-
-        LIST_FOREACH(rs, &vs->real_services, next) {
-            if ((rs->flags & LB_RS_F_AVAILABLE) && vs->sched->add(vs, rs) < 0) {
-                rs->flags &= ~LB_RS_F_AVAILABLE;
-            }
-        }
-        LB_VS_WUNLOCK(vs);
+    if (lb_vs_update_sched(vs, sched_name) < 0) {
+        unixctl_command_reply_error(fd, "update scheduler to %s failed.\n",
+                                    sched_name);
     }
 }
 
 UNIXCTL_CMD_REGISTER("vs/scheduler",
-                     "VIP:VPORT tcp|udp [iponly|ipport|rr|wrr].",
-                     "Show or set scheduler.", 2, 3, vs_scheduler_cmd_cb);
+                     "VIP VPORT tcp|udp [iponly|ipport|rr|wrr].",
+                     "Show or set scheduler.", 3, 4, vs_scheduler_cmd_cb);
 
 static int
-vs_stats_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                   uint8_t *proto, int *json_fmt) {
-    int rc;
+vs_stats_arg_parse(char *argv[], int argc, ip46_address_t *vip, uint16_t *vport,
+                   lb_proto_t *proto, int *json_fmt) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0)
-        return i - 1;
-
-    if (i < argc) {
-        *json_fmt = 1;
-        rc = strcmp(argv[i++], "--json");
-        if (rc != 0)
-            return i - 1;
-    } else {
-        *json_fmt = 0;
     }
-
-    return i;
+    if (parse_l4_port(argv[i++], vport) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
+    if (i == argc) {
+        *json_fmt = 0;
+        return i;
+    }
+    if (strcmp(argv[i++], "--json") == 0) {
+        *json_fmt = 1;
+        return i;
+    } else {
+        return i - 1;
+    }
 }
 
 static void
 vs_stats_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     int json_fmt = 0;
     int rc;
     struct lb_virt_service *vs;
-    struct lb_real_service *rs;
-    uint32_t socket_id, lcore_id;
+    uint32_t lcore_id;
     uint64_t rx_packets[2] = {0}, rx_bytes[2] = {0}, rx_drops[2] = {0};
     uint64_t tx_packets[2] = {0}, tx_bytes[2] = {0};
     uint64_t active_conns = 0, history_conns = 0, max_conns = 0;
+    struct lb_real_service *rs;
 
     rc = vs_stats_arg_parse(argv, argc, &vip, &vport, &proto, &json_fmt);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-
-        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            rx_packets[0] += vs->stats[lcore_id].packets[0];
-            rx_packets[1] += vs->stats[lcore_id].packets[1];
-            rx_bytes[0] += vs->stats[lcore_id].bytes[0];
-            rx_bytes[1] += vs->stats[lcore_id].bytes[1];
-            rx_drops[0] += vs->stats[lcore_id].drops[0];
-            rx_drops[1] += vs->stats[lcore_id].drops[1];
-            history_conns += vs->stats[lcore_id].conns;
-        }
-        active_conns += (uint64_t)rte_atomic32_read(&vs->active_conns);
-        LIST_FOREACH(rs, &vs->real_services, next) {
-            RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-                tx_packets[0] += rs->stats[lcore_id].packets[0];
-                tx_packets[1] += rs->stats[lcore_id].packets[1];
-                tx_bytes[0] += rs->stats[lcore_id].bytes[0];
-                tx_bytes[1] += rs->stats[lcore_id].bytes[1];
-            }
-        }
-
-        max_conns = vs->max_conns;
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    if (json_fmt)
-        unixctl_command_reply(fd, "{");
-
-    /* Just make it easy for agent to collect data. */
-    if (json_fmt)
-        unixctl_command_reply(fd, JSON_KV_64_FMT("max-conns", ","), max_conns);
-
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("active-conns", ",")
-                                   : NORM_KV_64_FMT("active-conns", "\n"),
-                          active_conns);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("history-conns", ",")
-                                   : NORM_KV_64_FMT("history-conns", "\n"),
-                          history_conns);
-
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[c2v]packets", ",")
-                                   : NORM_KV_64_FMT("[c2v]packets", "\n"),
-                          rx_packets[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[c2v]bytes", ",")
-                                   : NORM_KV_64_FMT("[c2v]bytes", "\n"),
-                          rx_bytes[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[c2v]drops", ",")
-                                   : NORM_KV_64_FMT("[c2v]drops", "\n"),
-                          rx_drops[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[r2v]packets", ",")
-                                   : NORM_KV_64_FMT("[r2v]packets", "\n"),
-                          rx_packets[1]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[r2v]bytes", ",")
-                                   : NORM_KV_64_FMT("[r2v]bytes", "\n"),
-                          rx_bytes[1]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[r2v]drops", ",")
-                                   : NORM_KV_64_FMT("[r2v]drops", "\n"),
-                          rx_drops[1]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[v2r]packets", ",")
-                                   : NORM_KV_64_FMT("[v2r]packets", "\n"),
-                          tx_packets[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[v2r]bytes", ",")
-                                   : NORM_KV_64_FMT("[v2r]bytes", "\n"),
-                          tx_bytes[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[v2c]packets", ",")
-                                   : NORM_KV_64_FMT("[v2c]packets", "\n"),
-                          tx_packets[1]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_64_FMT("[v2c]bytes", "")
-                                   : NORM_KV_64_FMT("[v2c]bytes", "\n"),
-                          tx_bytes[1]);
-
-    if (json_fmt)
-        unixctl_command_reply(fd, "}\n");
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        rx_packets[0] += vs->stats[lcore_id].packets[0];
+        rx_packets[1] += vs->stats[lcore_id].packets[1];
+        rx_bytes[0] += vs->stats[lcore_id].bytes[0];
+        rx_bytes[1] += vs->stats[lcore_id].bytes[1];
+        rx_drops[0] += vs->stats[lcore_id].drops[0];
+        rx_drops[1] += vs->stats[lcore_id].drops[1];
+        history_conns += vs->stats[lcore_id].conns;
+    }
+    active_conns = (uint64_t)rte_atomic32_read(&vs->active_conns);
+    LIST_FOREACH(rs, &vs->real_services, next) {
+        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+            tx_packets[0] += rs->stats[lcore_id].packets[0];
+            tx_packets[1] += rs->stats[lcore_id].packets[1];
+            tx_bytes[0] += rs->stats[lcore_id].bytes[0];
+            tx_bytes[1] += rs->stats[lcore_id].bytes[1];
+        }
+    }
+    max_conns = vs->max_conns;
+    if (json_fmt) {
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(obj, "max-conns", max_conns);
+        cJSON_AddNumberToObject(obj, "active-conns", active_conns);
+        cJSON_AddNumberToObject(obj, "history-conns", history_conns);
+        cJSON_AddNumberToObject(obj, "[c2v]packets", rx_packets[0]);
+        cJSON_AddNumberToObject(obj, "[c2v]bytes", rx_bytes[0]);
+        cJSON_AddNumberToObject(obj, "[c2v]drops", rx_drops[0]);
+        cJSON_AddNumberToObject(obj, "[r2v]packets", rx_packets[1]);
+        cJSON_AddNumberToObject(obj, "[r2v]bytes", rx_bytes[1]);
+        cJSON_AddNumberToObject(obj, "[r2v]drops", rx_drops[1]);
+        cJSON_AddNumberToObject(obj, "[v2r]packets", tx_packets[0]);
+        cJSON_AddNumberToObject(obj, "[v2r]bytes", tx_bytes[0]);
+        cJSON_AddNumberToObject(obj, "[v2c]packets", tx_packets[1]);
+        cJSON_AddNumberToObject(obj, "[v2c]bytes", tx_bytes[1]);
+        char *str = cJSON_PrintUnformatted(obj);
+        unixctl_command_reply_string(fd, str);
+        cJSON_free(str);
+        cJSON_Delete(obj);
+    } else {
+        unixctl_command_reply(fd, "active-conns: %" PRIu64 "\n", active_conns);
+        unixctl_command_reply(fd, "history-conns: %" PRIu64 "\n",
+                              history_conns);
+        unixctl_command_reply(fd, "[c2v]packets: %" PRIu64 "\n", rx_packets[0]);
+        unixctl_command_reply(fd, "[c2v]bytes: %" PRIu64 "\n", rx_bytes[0]);
+        unixctl_command_reply(fd, "[c2v]drops: %" PRIu64 "\n", rx_drops[0]);
+        unixctl_command_reply(fd, "[r2v]packets: %" PRIu64 "\n", rx_packets[1]);
+        unixctl_command_reply(fd, "[r2v]bytes: %" PRIu64 "\n", rx_bytes[1]);
+        unixctl_command_reply(fd, "[r2v]drops: %" PRIu64 "\n", rx_drops[1]);
+        unixctl_command_reply(fd, "[v2r]packets: %" PRIu64 "\n", tx_packets[0]);
+        unixctl_command_reply(fd, "[v2r]bytes: %" PRIu64 "\n", tx_bytes[0]);
+        unixctl_command_reply(fd, "[v2c]packets: %" PRIu64 "\n", tx_packets[1]);
+        unixctl_command_reply(fd, "[v2c]bytes: %" PRIu64 "\n", tx_bytes[1]);
+    }
 }
 
-UNIXCTL_CMD_REGISTER("vs/stats", "VIP:VPORT tcp|udp [--json].",
-                     "Show packet statistics of virtual service.", 2, 3,
+UNIXCTL_CMD_REGISTER("vs/stats", "VIP VPORT tcp|udp [--json].",
+                     "Show packet statistics of virtual service.", 3, 4,
                      vs_stats_cmd_cb);
 
 static int
-rs_add_arg_parse(char *argv[], __attribute((unused)) int argc, uint32_t *vip,
-                 uint16_t *vport, uint8_t *proto, uint32_t *rip,
-                 uint16_t *rport, int *weight) {
-    int rc;
+rs_add_arg_parse(char *argv[], int argc, ip46_address_t *vip, uint16_t *vport,
+                 lb_proto_t *proto, ip46_address_t *rip, uint16_t *rport,
+                 int *weight) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    rc = parse_ipv4_port(argv[i++], rip, rport);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
+    if (parse_ip46_address(argv[i++], rip) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_port(argv[i++], rport) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
-        rc = parser_read_uint16((uint16_t *)weight, argv[i++]);
-        if (rc < 0)
+        if (parser_read_uint16((uint16_t *)weight, argv[i++]) < 0) {
             return i - 1;
+        }
     } else {
         *weight = 0;
     }
@@ -1121,16 +979,15 @@ rs_add_arg_parse(char *argv[], __attribute((unused)) int argc, uint32_t *vip,
 
 static void
 rs_add_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
-    uint32_t rip;
+    lb_proto_t proto = LB_PROTO_MAX;
+    ip46_address_t rip;
     uint16_t rport;
     int weight;
     int rc;
-    uint32_t socket_id;
-    struct lb_virt_service *vss[RTE_MAX_NUMA_NODES] = {0};
-    struct lb_real_service *rss[RTE_MAX_NUMA_NODES] = {0};
+    struct lb_virt_service *vs;
+    struct lb_real_service *rs;
 
     rc = rs_add_arg_parse(argv, argc, &vip, &vport, &proto, &rip, &rport,
                           &weight);
@@ -1138,102 +995,62 @@ rs_add_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vss[socket_id] = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        if (vs_find_rs(vss[socket_id], rip, rport) != NULL) {
-            unixctl_command_reply_error(fd, "Real service is exist.\n");
-            return;
-        }
+    if ((rs = lb_rs_table_lookup_inline(vs, &rip, rport)) != NULL) {
+        unixctl_command_reply_error(fd, "Real service is exist.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        rss[socket_id] = lb_rs_alloc(rip, rport, weight, vss[socket_id]);
-        if (rss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Not enough memory.\n");
-            goto free_rss;
-        }
+    if (!(rs = lb_rs_create(&rip, rport, weight, vs))) {
+        unixctl_command_reply_error(fd, "Create real service failed.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        LB_VS_WLOCK(vss[socket_id]);
-        lb_rs_list_insert_by_weight(vss[socket_id], rss[socket_id]);
-        rss[socket_id]->flags |= LB_RS_F_AVAILABLE;
-        rc = vss[socket_id]->sched->add(vss[socket_id], rss[socket_id]);
-        if (rc < 0) {
-            rss[socket_id]->flags &= ~LB_RS_F_AVAILABLE;
-            LIST_REMOVE(rss[socket_id], next);
-            LB_VS_WUNLOCK(vss[socket_id]);
-            unixctl_command_reply_error(fd, "Not enough memory.\n");
-            goto del_sched;
-        }
-        LB_VS_WUNLOCK(vss[socket_id]);
+    if (lb_rs_sched_enable(rs, 1) < 0) {
+        lb_rs_put(rs);
+        unixctl_command_reply_error(fd, "Cannot enable real service sched.");
+        return;
     }
-
-    return;
-
-del_sched:
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        LB_VS_WLOCK(vss[socket_id]);
-        if (rss[socket_id]->flags & LB_RS_F_AVAILABLE) {
-            LIST_REMOVE(rss[socket_id], next);
-            rss[socket_id]->flags &= ~LB_RS_F_AVAILABLE;
-            vss[socket_id]->sched->del(vss[socket_id], rss[socket_id]);
-        }
-        LB_VS_WUNLOCK(vss[socket_id]);
-    }
-
-free_rss:
-    VS_TBL_FOREACH_SOCKET(socket_id) { lb_rs_free(rss[socket_id]); }
+    lb_rs_table_add_inline(vs, rs);
 }
 
-UNIXCTL_CMD_REGISTER("rs/add", "VIP:VPORT tcp|udp RIP:RPORT [WEIGHT].",
-                     "Add real service.", 3, 4, rs_add_cmd_cb);
+UNIXCTL_CMD_REGISTER("rs/add", "VIP VPORT tcp|udp RIP RPORT [WEIGHT].",
+                     "Add real service.", 5, 6, rs_add_cmd_cb);
 
 static int
-rs_del_arg_parse(char *argv[], __attribute((unused)) int argc, uint32_t *vip,
-                 uint16_t *vport, uint8_t *proto, uint32_t *rip,
-                 uint16_t *rport) {
-    int rc;
+rs_del_arg_parse(char *argv[], __attribute((unused)) int argc,
+                 ip46_address_t *vip, uint16_t *vport, lb_proto_t *proto,
+                 ip46_address_t *rip, uint16_t *rport) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    rc = parse_ipv4_port(argv[i++], rip, rport);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
+    if (parse_ip46_address(argv[i++], rip) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_port(argv[i++], rport) < 0) {
+        return i - 1;
+    }
     return i;
 }
 
 static void
 rs_del_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
-    uint32_t rip;
+    lb_proto_t proto = LB_PROTO_MAX;
+    ip46_address_t rip;
     uint16_t rport;
     int rc;
-    uint32_t socket_id;
-    struct lb_virt_service *vss[RTE_MAX_NUMA_NODES] = {0};
+    struct lb_virt_service *vs;
     struct lb_real_service *rs;
 
     rc = rs_del_arg_parse(argv, argc, &vip, &vport, &proto, &rip, &rport);
@@ -1241,148 +1058,125 @@ rs_del_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vss[socket_id] = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        rs = vs_find_rs(vss[socket_id], rip, rport);
-        if (rs == NULL)
-            continue;
-
-        LB_VS_WLOCK(vss[socket_id]);
-        LIST_REMOVE(rs, next);
-        if (rs->flags & LB_RS_F_AVAILABLE) {
-            rs->flags &= ~LB_RS_F_AVAILABLE;
-            vss[socket_id]->sched->del(vss[socket_id], rs);
-        }
-        LB_VS_WUNLOCK(vss[socket_id]);
-
-        lb_rs_free(rs);
+    if (!(rs = lb_rs_table_lookup_inline(vs, &rip, rport))) {
+        return;
     }
+    lb_rs_sched_enable(rs, 0);
+    lb_rs_table_del_inline(vs, rs);
+    lb_rs_put(rs);
 }
 
-UNIXCTL_CMD_REGISTER("rs/del", "VIP:VPORT tcp|udp RIP:RPORT.",
-                     "Del real service.", 3, 3, rs_del_cmd_cb);
+UNIXCTL_CMD_REGISTER("rs/del", "VIP VPORT tcp|udp RIP RPORT.",
+                     "Del real service.", 5, 5, rs_del_cmd_cb);
 
 static int
-rs_list_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                  uint8_t *proto, int *json_fmt) {
-    int rc;
+rs_list_arg_parse(char *argv[], int argc, ip46_address_t *vip, uint16_t *vport,
+                  lb_proto_t *proto, int *json_fmt) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0)
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0)
-        return i - 1;
-
-    if (i < argc) {
-        *json_fmt = 1;
-        rc = strcmp(argv[i++], "--json");
-        if (rc != 0)
-            return i - 1;
-    } else {
-        *json_fmt = 0;
     }
-
-    return i;
+    if (parse_l4_port(argv[i++], vport) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_proto(argv[i++], proto) < 0) {
+        return i - 1;
+    }
+    if (i == argc) {
+        *json_fmt = 0;
+        return i;
+    }
+    if (strcmp(argv[i++], "--json") == 0) {
+        *json_fmt = 1;
+        return i;
+    } else {
+        return i - 1;
+    }
 }
 
 static void
 rs_list_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
-    int json_fmt = 0, json_first_obj = 1;
+    lb_proto_t proto = LB_PROTO_MAX;
+    int json_fmt = 0;
     int rc;
-    uint32_t socket_id;
-    struct lb_virt_service *vs = NULL;
+    struct lb_virt_service *vs;
     struct lb_real_service *rs;
-    char buf[32];
+    char ipbuf[INET6_ADDRSTRLEN];
 
     rc = rs_list_arg_parse(argv, argc, &vip, &vport, &proto, &json_fmt);
     if (rc != argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
+    }
+    if (json_fmt) {
+        cJSON *array = cJSON_CreateArray();
+        if (!array)
             return;
-        }
-        if (json_fmt)
-            unixctl_command_reply(fd, "[");
-        else
-            unixctl_command_reply(
-                fd, "IP              Port   Type  Status  Weight\n");
         LIST_FOREACH(rs, &vs->real_services, next) {
-            ipv4_addr_tostring(rs->rip, buf, sizeof(buf));
-            if (json_fmt) {
-                unixctl_command_reply(fd, json_first_obj ? "{" : ",{");
-                json_first_obj = 0;
-                unixctl_command_reply(fd, JSON_KV_S_FMT("ip", ","), buf);
-                unixctl_command_reply(fd, JSON_KV_32_FMT("port", ","),
-                                      rte_be_to_cpu_16(rs->rport));
-                unixctl_command_reply(fd, JSON_KV_S_FMT("type", ","),
-                                      l4proto_format(rs->proto));
-                unixctl_command_reply(fd, JSON_KV_S_FMT("status", ","),
-                                      rs->flags & LB_RS_F_AVAILABLE ? "up"
-                                                                    : "down");
-                unixctl_command_reply(fd, JSON_KV_32_FMT("weight", "}"),
-                                      (uint32_t)rs->weight);
-            } else {
-                unixctl_command_reply(
-                    fd, "%-15s  %-5u  %-4s  %-6s  %-10d\n", buf,
-                    rte_be_to_cpu_16(rs->rport), l4proto_format(rs->proto),
-                    rs->flags & LB_RS_F_AVAILABLE ? "up" : "down", rs->weight);
-            }
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "ip",
+                                    ip46_address_format(&rs->raddr, ipbuf));
+            cJSON_AddNumberToObject(obj, "port", rte_be_to_cpu_16(rs->rport));
+            cJSON_AddStringToObject(obj, "type",
+                                    l4proto_format(rs->virt_service->proto));
+            cJSON_AddStringToObject(
+                obj, "status", rs->flags & LB_RS_F_AVAILABLE ? "up" : "down");
+            cJSON_AddNumberToObject(obj, "weight", rs->sched_node.weight);
+            cJSON_AddItemToArray(array, obj);
         }
-        if (json_fmt)
-            unixctl_command_reply(fd, "]\n");
-
-        break;
+        char *str = cJSON_PrintUnformatted(array);
+        unixctl_command_reply_string(fd, str);
+        cJSON_free(str);
+        cJSON_Delete(array);
+    } else {
+        unixctl_command_reply(fd, "%-45s  %-5s  %-4s  %-6s  %-10s\n", "IP",
+                              "Port", "Type", "Status", "Weight");
+        LIST_FOREACH(rs, &vs->real_services, next) {
+            unixctl_command_reply(fd, "%-45s  %-5u  %-4s  %-6s  %-10d\n",
+                                  ip46_address_format(&rs->raddr, ipbuf),
+                                  rte_be_to_cpu_16(rs->rport),
+                                  l4proto_format(rs->virt_service->proto),
+                                  rs->flags & LB_RS_F_AVAILABLE ? "up" : "down",
+                                  rs->sched_node.weight);
+        }
     }
 }
 
-UNIXCTL_CMD_REGISTER("rs/list", "VIP:VPORT tcp|udp [--json].",
-                     "List all real services.", 2, 3, rs_list_cmd_cb);
+UNIXCTL_CMD_REGISTER("rs/list", "VIP VPORT tcp|udp [--json].",
+                     "List all real services.", 3, 4, rs_list_cmd_cb);
 
 static int
-rs_status_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                    uint8_t *proto, uint32_t *rip, uint16_t *rport,
-                    uint8_t *echo, uint8_t *op) {
-    int rc;
+rs_status_arg_parse(char *argv[], int argc, ip46_address_t *vip,
+                    uint16_t *vport, lb_proto_t *proto, ip46_address_t *rip,
+                    uint16_t *rport, uint8_t *echo, uint8_t *op) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    rc = parse_ipv4_port(argv[i++], rip, rport);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
+    if (parse_ip46_address(argv[i++], rip) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_port(argv[i++], rport) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
         if (strcmp("up", argv[i]) == 0) {
@@ -1396,20 +1190,17 @@ rs_status_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
     } else {
         *echo = 1;
     }
-
     return i;
 }
 
 static void
 rs_status_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip, rip;
+    ip46_address_t vip, rip;
     uint16_t vport, rport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
-    uint8_t op;
+    uint8_t op = 0;
     int rc;
-    uint32_t socket_id;
-    struct lb_virt_service *vss[RTE_MAX_NUMA_NODES] = {0};
     struct lb_virt_service *vs;
     struct lb_real_service *rs;
 
@@ -1419,91 +1210,49 @@ rs_status_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vss[socket_id] = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vss[socket_id];
-        rs = vs_find_rs(vs, rip, rport);
-        if (rs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find real service.\n");
-            return;
-        }
-
-        if (echo) {
-            unixctl_command_reply(
-                fd, "%s\n", rs->flags & LB_RS_F_AVAILABLE ? "up" : "down");
-            return;
-        }
-
-        if (rs->flags & LB_RS_F_AVAILABLE && !op) {
-            LB_VS_WLOCK(vs);
-            rs->flags &= ~LB_RS_F_AVAILABLE;
-            vs->sched->del(vs, rs);
-            LB_VS_WUNLOCK(vs);
-        } else if (!(rs->flags & LB_RS_F_AVAILABLE) && op) {
-            LB_VS_WLOCK(vs);
-            rs->flags |= LB_RS_F_AVAILABLE;
-            if (vs->sched->add(vs, rs) < 0) {
-                rs->flags &= ~LB_RS_F_AVAILABLE;
-                LB_VS_WUNLOCK(vs);
-                goto failed;
-            }
-            LB_VS_WUNLOCK(vs);
-        }
+    if (!(rs = lb_rs_table_lookup_inline(vs, &rip, rport))) {
+        return;
     }
-    return;
-
-failed:
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vss[socket_id];
-        if (rs->flags & LB_RS_F_AVAILABLE) {
-            LB_VS_WLOCK(vs);
-            rs->flags &= ~LB_RS_F_AVAILABLE;
-            vs->sched->del(vs, rs);
-            LB_VS_WUNLOCK(vs);
-        }
+    if (echo) {
+        unixctl_command_reply(fd, "%s\n",
+                              rs->flags & LB_RS_F_AVAILABLE ? "up" : "down");
+    } else {
+        lb_rs_sched_enable(rs, op);
     }
 }
 
-UNIXCTL_CMD_REGISTER("rs/status", "VIP:VPORT tcp|udp RIP:RPORT [down|up].",
-                     "Show or set the status of real services.", 3, 4,
+UNIXCTL_CMD_REGISTER("rs/status", "VIP VPORT tcp|udp RIP RPORT [down|up].",
+                     "Show or set the status of real services.", 5, 6,
                      rs_status_cmd_cb);
 
 static int
-rs_weight_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                    uint8_t *proto, uint32_t *rip, uint16_t *rport,
-                    uint8_t *echo, int *weight) {
-    int rc;
+rs_weight_arg_parse(char *argv[], int argc, ip46_address_t *vip,
+                    uint16_t *vport, lb_proto_t *proto, ip46_address_t *rip,
+                    uint16_t *rport, uint8_t *echo, int *weight) {
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    rc = parse_ipv4_port(argv[i++], rip, rport);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
+    if (parse_ip46_address(argv[i++], rip) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_port(argv[i++], rport) < 0) {
+        return i - 1;
+    }
     if (i < argc) {
         *echo = 0;
-        rc = parser_read_uint16((uint16_t *)weight, argv[i++]);
-        if (rc < 0)
+        if (parser_read_uint16((uint16_t *)weight, argv[i++]) < 0)
             return i - 1;
     } else {
         *echo = 1;
@@ -1514,14 +1263,13 @@ rs_weight_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
 
 static void
 rs_weight_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip, rip;
+    ip46_address_t vip, rip;
     uint16_t vport, rport;
-    uint8_t proto;
+    lb_proto_t proto = LB_PROTO_MAX;
     uint8_t echo = 0;
     int weight;
     int rc;
-    uint32_t socket_id;
-    struct lb_virt_service *vss[RTE_MAX_NUMA_NODES] = {0};
+    struct lb_virt_service *vs;
     struct lb_real_service *rs;
 
     rc = rs_weight_arg_parse(argv, argc, &vip, &vport, &proto, &rip, &rport,
@@ -1530,84 +1278,66 @@ rs_weight_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vss[socket_id] = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vss[socket_id] == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        rs = vs_find_rs(vss[socket_id], rip, rport);
-        if (rs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find real service.\n");
-            return;
-        }
-        if (echo) {
-            unixctl_command_reply(fd, "%d\n", rs->weight);
-            return;
-        }
-
-        LB_VS_WLOCK(vss[socket_id]);
-        rs->weight = weight;
-        lb_rs_list_update_by_weight(vss[socket_id], rs);
-        vss[socket_id]->sched->update(vss[socket_id], rs);
-        LB_VS_WUNLOCK(vss[socket_id]);
+    if (!(rs = lb_rs_table_lookup_inline(vs, &rip, rport))) {
+        return;
+    }
+    if (echo) {
+        unixctl_command_reply(fd, "%d\n", rs->sched_node.weight);
+    } else {
+        lb_rs_update_weight(rs, weight);
     }
 }
 
-UNIXCTL_CMD_REGISTER("rs/weight", "VIP:VPORT tcp|udp RIP:RPORT [WEIGHT].",
-                     "Show or set the weight of real services.", 3, 4,
+UNIXCTL_CMD_REGISTER("rs/weight", "VIP VPORT tcp|udp RIP RPORT [WEIGHT].",
+                     "Show or set the weight of real services.", 5, 6,
                      rs_weight_cmd_cb);
 
 static int
-rs_stats_arg_parse(char *argv[], int argc, uint32_t *vip, uint16_t *vport,
-                   uint8_t *proto, uint32_t *rip, uint16_t *rport,
+rs_stats_arg_parse(char *argv[], int argc, ip46_address_t *vip, uint16_t *vport,
+                   lb_proto_t *proto, ip46_address_t *rip, uint16_t *rport,
                    int *json_fmt) {
-    int rc;
     int i = 0;
 
-    /* ip:port */
-    rc = parse_ipv4_port(argv[i++], vip, vport);
-    if (rc < 0) {
+    if (parse_ip46_address(argv[i++], vip) < 0) {
         return i - 1;
     }
-
-    /*  proto */
-    rc = parse_l4_proto(argv[i++], proto);
-    if (rc < 0) {
+    if (parse_l4_port(argv[i++], vport) < 0) {
         return i - 1;
     }
-
-    rc = parse_ipv4_port(argv[i++], rip, rport);
-    if (rc < 0) {
+    if (parse_l4_proto(argv[i++], proto) < 0) {
         return i - 1;
     }
-
-    if (i < argc) {
-        *json_fmt = 1;
-        rc = strcmp(argv[i++], "--json");
-        if (rc != 0)
-            return i - 1;
-    } else {
+    if (parse_ip46_address(argv[i++], rip) < 0) {
+        return i - 1;
+    }
+    if (parse_l4_port(argv[i++], rport) < 0) {
+        return i - 1;
+    }
+    if (i == argc) {
         *json_fmt = 0;
+        return i;
     }
-
-    return i;
+    if (strcmp(argv[i++], "--json") == 0) {
+        *json_fmt = 1;
+        return i;
+    } else {
+        return i - 1;
+    }
 }
 
 static void
 rs_stats_cmd_cb(int fd, char *argv[], int argc) {
-    uint32_t vip;
+    ip46_address_t vip;
     uint16_t vport;
-    uint8_t proto;
-    uint32_t rip;
+    lb_proto_t proto = LB_PROTO_MAX;
+    ip46_address_t rip;
     uint16_t rport;
     int json_fmt = 0;
     int rc;
-    uint32_t socket_id;
     struct lb_virt_service *vs;
     struct lb_real_service *rs;
     uint32_t lcore_id;
@@ -1620,60 +1350,43 @@ rs_stats_cmd_cb(int fd, char *argv[], int argc) {
         unixctl_command_reply_error(fd, "Invalid parameter: %s.\n", argv[rc]);
         return;
     }
-
-    VS_TBL_FOREACH_SOCKET(socket_id) {
-        vs = vs_tbl_find(lb_vs_tbls[socket_id], vip, vport, proto);
-        if (vs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find virt service.\n");
-            return;
-        }
-
-        rs = vs_find_rs(vs, rip, rport);
-        if (rs == NULL) {
-            unixctl_command_reply_error(fd, "Cannot find real service.\n");
-            return;
-        }
-
-        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            packets[0] += rs->stats[lcore_id].packets[0];
-            packets[1] += rs->stats[lcore_id].packets[1];
-            bytes[0] += rs->stats[lcore_id].bytes[0];
-            bytes[1] += rs->stats[lcore_id].bytes[1];
-            history_conns += rs->stats[lcore_id].conns;
-            active_conns += (uint64_t)rte_atomic32_read(&rs->active_conns);
-        }
+    if (!(vs = lb_vs_table_lookup_inline(&vip, vport, proto))) {
+        unixctl_command_reply_error(fd, "Cannot find virt service.\n");
+        return;
     }
-
-    if (json_fmt)
-        unixctl_command_reply(fd, "{");
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("active-conns", ",")
-                                   : NORM_KV_32_FMT("active-conns", "\n"),
-                          active_conns);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("history-conns", ",")
-                                   : NORM_KV_32_FMT("history-conns", "\n"),
-                          history_conns);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2r]packets", ",")
-                                   : NORM_KV_32_FMT("[v2r]packets", "\n"),
-                          packets[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[v2r]bytes", ",")
-                                   : NORM_KV_32_FMT("[v2r]bytes", "\n"),
-                          bytes[0]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[r2v]packets", ",")
-                                   : NORM_KV_32_FMT("[r2v]packets", "\n"),
-                          packets[1]);
-    unixctl_command_reply(fd,
-                          json_fmt ? JSON_KV_32_FMT("[r2v]bytes", "")
-                                   : NORM_KV_32_FMT("[r2v]bytes", "\n"),
-                          bytes[1]);
-    if (json_fmt)
-        unixctl_command_reply(fd, "}\n");
+    if (!(rs = lb_rs_table_lookup_inline(vs, &rip, rport))) {
+        return;
+    }
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        packets[0] += rs->stats[lcore_id].packets[0];
+        packets[1] += rs->stats[lcore_id].packets[1];
+        bytes[0] += rs->stats[lcore_id].bytes[0];
+        bytes[1] += rs->stats[lcore_id].bytes[1];
+        history_conns += rs->stats[lcore_id].conns;
+        active_conns += (uint64_t)rte_atomic32_read(&rs->active_conns);
+    }
+    if (json_fmt) {
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(obj, "active-conns", active_conns);
+        cJSON_AddNumberToObject(obj, "history-conns", active_conns);
+        cJSON_AddNumberToObject(obj, "[v2r]packets", active_conns);
+        cJSON_AddNumberToObject(obj, "[v2r]bytes", active_conns);
+        cJSON_AddNumberToObject(obj, "[r2v]packets", active_conns);
+        cJSON_AddNumberToObject(obj, "[r2v]bytes", active_conns);
+        char *str = cJSON_PrintUnformatted(obj);
+        unixctl_command_reply_string(fd, str);
+        cJSON_free(str);
+        cJSON_Delete(obj);
+    } else {
+        unixctl_command_reply(fd, "active-conns: %u\n", active_conns);
+        unixctl_command_reply(fd, "history-conns: %u\n", history_conns);
+        unixctl_command_reply(fd, "[v2r]packets: %u\n", packets[0]);
+        unixctl_command_reply(fd, "[v2r]bytes: %u\n", bytes[0]);
+        unixctl_command_reply(fd, "[r2v]packets: %u\n", packets[1]);
+        unixctl_command_reply(fd, "[r2v]bytes: %u\n", bytes[1]);
+    }
 }
 
-UNIXCTL_CMD_REGISTER("rs/stats", "VIP:VPORT tcp|udp RIP:RPORT.",
-                     "Show the packet stats of real services.", 3, 4,
+UNIXCTL_CMD_REGISTER("rs/stats", "VIP VPORT tcp|udp RIP RPORT.",
+                     "Show the packet stats of real services.", 5, 6,
                      rs_stats_cmd_cb);

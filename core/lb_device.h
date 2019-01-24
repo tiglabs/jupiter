@@ -4,197 +4,119 @@
 #define __LB_DEVICE_H__
 
 #include <rte_ethdev.h>
-#include <rte_ether.h>
-#include <rte_ip.h>
 #include <rte_kni.h>
-#include <rte_pci.h>
+#include <rte_mbuf.h>
 #include <rte_ring.h>
+#include <rte_spinlock.h>
 
-#include "lb_arp.h"
 #include "lb_config.h"
-#include "lb_proto.h"
-
-#define PKT_MAX_BURST 32
-
-#define LB_MIN_L4_PORT (1024)
-#define LB_MAX_L4_PORT (65535)
+#include "lb_ip_address.h"
 
 enum {
-    LB_DEV_T_NORM = 0, /* Normal port. */
-    LB_DEV_T_BOND,     /* Bond port. */
-};
-
-struct lb_laddr {
-    uint32_t ipv4;
-    uint16_t port_id;
-    uint16_t rxq_id;
-    struct rte_ring *ports[LB_IPPROTO_MAX];
-};
-
-struct lb_laddr_list {
-    uint32_t nb;
-    struct lb_laddr entries[LB_MAX_LADDR];
+    LB_DEV_OUTBOUND,
+    LB_DEV_INBOUND,
+    LB_DEV_NUM,
 };
 
 struct lb_device {
-    uint16_t type;
-
-    uint32_t port_id;
-    uint32_t socket_id;
+    uint16_t port_id;
+    ip4_address_t ip4;
+    ip4_address_t ip4_gw;
+    ip4_address_t ip4_netmask;
+    ip6_address_t ip6;
+    ip6_address_t ip6_gw;
+    ip6_address_t ip6_netmask;
 
     struct ether_addr ha;
-    uint16_t mtu;
 
-    uint32_t ipv4;
-    uint32_t netmask;
-    uint32_t gw;
+    rte_spinlock_t txq_lock;
+    struct rte_eth_dev_tx_buffer *tx_buffers[RTE_MAX_QUEUES_PER_PORT];
 
-    uint16_t nb_rxq, nb_txq;
-    uint16_t rxq_size, txq_size;
+    rte_spinlock_t kni_lock;
+    struct rte_kni *kni;
+    char name[RTE_KNI_NAMESIZE];
 
-    uint32_t rx_offload;
-    uint32_t tx_offload;
-
-    struct {
-        uint32_t rxq_enable;
-        uint16_t rxq_id;
-        uint16_t txq_id;
-    } lcore_conf[RTE_MAX_LCORE];
+    struct rte_ring *pkt_dispatch_queues[RTE_MAX_LCORE];
+    struct rte_hash *vip_lip_hash;
 
     struct {
         uint64_t rx_dropped;
         uint64_t tx_dropped;
     } lcore_stats[RTE_MAX_LCORE];
-
-    struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_LCORE];
-
-    char name[RTE_KNI_NAMESIZE];
-
-    struct rte_kni *kni;
-
-    struct rte_mempool *mp;
-
-    /* master-worker threads communication */
-    struct rte_ring *ring;
-
-    struct lb_laddr_list laddr_list[RTE_MAX_LCORE];
-
-    uint32_t nb_slaves;
-    uint32_t slave_ports[RTE_MAX_ETHPORTS];
 };
 
-extern struct lb_device *lb_devices[RTE_MAX_ETHPORTS];
-extern uint16_t lb_device_count;
+extern struct lb_device *lb_devices[LB_DEV_NUM];
+extern struct rte_mempool *pktmbuf_pool;
 
-#define LB_DEVICE_FOREACH(i, dev)                                              \
-    for (i = 0; (dev = lb_devices[i]) != NULL; i++)
-
-static inline int
-lb_is_laddr_exist(uint32_t lip, struct lb_device *dev) {
-    struct lb_laddr_list *list;
-    uint32_t lcore_id = rte_lcore_id();
-    uint32_t i;
-
-    list = &dev->laddr_list[lcore_id];
-    for (i = 0; i < list->nb; i++) {
-        if (lip == list->entries[i].ipv4)
-            return 1;
-    }
-    return 0;
+static inline struct lb_device *
+lb_device_get_inbound(void) {
+    return lb_devices[LB_DEV_INBOUND];
 }
 
-static inline int
-lb_laddr_get(struct lb_device *dev, enum lb_proto_type type,
-             struct lb_laddr **laddr, uint16_t *port) {
-    struct lb_laddr_list *list;
-    struct lb_laddr *addr;
-    void *p = NULL;
-    uint32_t lcore_id, i;
-
-    lcore_id = rte_lcore_id();
-    list = &dev->laddr_list[lcore_id];
-
-    for (i = 0; i < list->nb; i++) {
-        addr = &list->entries[i];
-        if (rte_ring_sc_dequeue(addr->ports[type], (void **)&p) == 0) {
-            *laddr = addr;
-            *port = (uint16_t)(uintptr_t)p;
-            return 0;
-        }
-    }
-    return -1;
-}
-
-static inline void
-lb_laddr_put(struct lb_laddr *laddr, uint16_t port, enum lb_proto_type type) {
-    rte_ring_sp_enqueue(laddr->ports[type], (void *)(uintptr_t)port);
-}
-
-#define IS_SAME_NETWORK(addr1, addr2, netmask)                                 \
-    ((addr1 & netmask) == (addr2 & netmask))
-
-static inline int
-lb_device_dst_mac_find(uint32_t dip, struct ether_addr *ea,
-                       struct lb_device *dev) {
-    uint32_t rip;
-    int rc;
-
-    if (IS_SAME_NETWORK(dip, dev->ipv4, dev->netmask)) {
-        rip = dip;
-    } else {
-        rip = dev->gw;
-    }
-
-    rc = lb_arp_find(rip, ea, dev);
-    if (rc < 0) {
-        lb_arp_request(rip, dev);
-    }
-
-    return rc;
-}
-
-static inline void
-lb_device_tx_mbuf(struct rte_mbuf *m, struct lb_device *dev) {
-    uint32_t lcore_id;
-    uint16_t txq_id;
-    struct rte_eth_dev_tx_buffer *tx_buffer;
-
-    lcore_id = rte_lcore_id();
-    txq_id = dev->lcore_conf[lcore_id].txq_id;
-    tx_buffer = dev->tx_buffer[lcore_id];
-    rte_eth_tx_buffer(dev->port_id, txq_id, tx_buffer, m);
-}
-
-static inline int
-lb_device_output(struct rte_mbuf *m, struct ipv4_hdr *iph,
-                 struct lb_device *dev) {
-    struct ether_hdr *eth;
-    int rc;
-
-    eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
-
-    rc = lb_device_dst_mac_find(iph->dst_addr, &eth->d_addr, dev);
-    if (rc < 0) {
-        rte_pktmbuf_free(m);
-        return rc;
-    }
-    ether_addr_copy(&dev->ha, &eth->s_addr);
-    eth->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
-
-    lb_device_tx_mbuf(m, dev);
-    return 0;
+static inline struct lb_device *
+lb_device_get_outbound(void) {
+    return lb_devices[LB_DEV_OUTBOUND];
 }
 
 static inline struct rte_mbuf *
-lb_device_pktmbuf_alloc(struct lb_device *dev) {
-    return rte_pktmbuf_alloc(dev->mp);
+lb_pktmbuf_alloc(void) {
+    return rte_pktmbuf_alloc(pktmbuf_pool);
 }
 
-static inline struct rte_mbuf *
-lb_device_pktmbuf_clone(struct rte_mbuf *m, struct lb_device *dev) {
-    return rte_pktmbuf_clone(m, dev->mp);
+static inline void
+lb_device_pkt_dispatch_enqueue(struct lb_device *dev, struct rte_mbuf *pkt,
+                               uint32_t lcore_id) {
+    if (rte_ring_enqueue(dev->pkt_dispatch_queues[lcore_id], pkt) < 0) {
+        rte_pktmbuf_free(pkt);
+    }
 }
 
-int lb_device_init(struct lb_device_conf *configs, uint16_t num);
+static inline uint16_t
+lb_device_pkt_dispatch_dequeue(struct lb_device *dev, struct rte_mbuf *pkt[],
+                               uint16_t num, uint32_t lcore_id) {
+    return rte_ring_dequeue_burst(dev->pkt_dispatch_queues[lcore_id],
+                                  (void **)pkt, num, NULL);
+}
 
-#endif /* __LB_DEVICE_H__ */
+int lb_device_module_init(struct lb_conf *lb_cfg);
+
+void lb_device_xmit_burst(struct lb_device *dev, struct rte_mbuf **pkts,
+                          uint32_t num);
+void lb_device_xmit(struct lb_device *dev, struct rte_mbuf *m);
+void lb_device_flush(struct lb_device *dev);
+uint16_t lb_device_rx_burst(struct lb_device *dev, struct rte_mbuf **pkts,
+                            uint16_t num);
+void lb_device_kni_rx_handle(struct lb_device *dev);
+void lb_device_kni_xmit(struct lb_device *dev, struct rte_mbuf *m);
+
+int lb_device_ip4_output(struct rte_mbuf *m, ip4_address_t *dst_addr,
+                         struct lb_device *dev);
+int lb_device_ip6_output(struct rte_mbuf *m, ip6_address_t *dst_addr,
+                         struct lb_device *dev);
+
+int lb_device_add_vip_lip(struct lb_device *dev, ip46_address_t *ip46);
+void lb_device_del_vip_lip(struct lb_device *dev, ip46_address_t *ip46);
+int lb_device_vip_lip_is_exist_v4(struct lb_device *dev, ip4_address_t *ip4);
+int lb_device_vip_lip_is_exist_v6(struct lb_device *dev, ip6_address_t *ip6);
+
+static inline void
+lb_inbound_device_ip4_output(struct rte_mbuf *m, ip4_address_t *dst_addr) {
+    lb_device_ip4_output(m, dst_addr, lb_device_get_inbound());
+}
+
+static inline void
+lb_outbound_device_ip4_output(struct rte_mbuf *m, ip4_address_t *dst_addr) {
+    lb_device_ip4_output(m, dst_addr, lb_device_get_outbound());
+}
+
+static inline void
+lb_inbound_device_ip6_output(struct rte_mbuf *m, ip6_address_t *dst_addr) {
+    lb_device_ip6_output(m, dst_addr, lb_device_get_inbound());
+}
+
+static inline void
+lb_outbound_device_ip6_output(struct rte_mbuf *m, ip6_address_t *dst_addr) {
+    lb_device_ip6_output(m, dst_addr, lb_device_get_outbound());
+}
+
+#endif

@@ -11,7 +11,7 @@ machine = native
 endif
 
 RTE_SDK = $(CURDIR)/dpdk
-RTE_TARGET = x86_64-$(machine)-linuxapp-gcc
+RTE_TARGET = x86_64-native-linuxapp-gcc
 LB_DIR = $(CURDIR)
 
 export RTE_SDK

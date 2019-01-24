@@ -9,6 +9,6 @@ LIB = libcmd.a
 SRCS-y := unixctl_command.c
 SYMLINK-y-include += unixctl_command.h
 
-CFLAGS += $(WERROR_FLAGS) -g -O3
+CFLAGS += $(WERROR_FLAGS) -g -O2
 
 include $(RTE_SDK)/mk/rte.extlib.mk

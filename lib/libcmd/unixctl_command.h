@@ -37,6 +37,7 @@ extern struct unixctl_cmd_head unixctl_cmd_entries;
 
 int unixctl_command_reply(int fd, const char *format, ...);
 int unixctl_command_reply_error(int fd, const char *format, ...);
+int unixctl_command_reply_string(int fd, const char *string);
 
 int unixctl_server_create(const char *path);
 void unixctl_server_destory(int fd, const char *path);
@@ -47,4 +48,3 @@ void unixctl_client_destory(int fd, const char *path);
 int unixctl_client_request(int fd, const char *cmdline);
 
 #endif
-

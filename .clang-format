@@ -1,1 +1,4 @@
-{BasedOnStyle: LLVM, IndentWidth: 4, AlwaysBreakAfterReturnType: TopLevelDefinitions}
+BasedOnStyle: LLVM
+IndentWidth: 4
+AlwaysBreakAfterReturnType: TopLevelDefinitions
+ColumnLimit: 80
