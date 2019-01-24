@@ -137,11 +137,16 @@ rr_sched_add(struct lb_virt_service *vs,
              __rte_unused struct lb_real_service *rs) {
     struct rr_data *rr = vs->sched_data;
     uint32_t lcore_id;
+    struct lb_real_service *real_service;
 
     if (unlikely(rr == NULL))
         return -1;
+    LIST_FOREACH(real_service, &vs->real_services, next) {
+        if (real_service->flags & LB_RS_F_AVAILABLE)
+            break;
+    }
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        rr->real_services[lcore_id] = LIST_FIRST(&vs->real_services);
+        rr->real_services[lcore_id] = real_service;
     }
     return 0;
 }
@@ -151,11 +156,16 @@ rr_sched_del(struct lb_virt_service *vs,
              __rte_unused struct lb_real_service *rs) {
     struct rr_data *rr = vs->sched_data;
     uint32_t lcore_id;
+    struct lb_real_service *real_service;
 
     if (unlikely(rr == NULL))
         return -1;
+    LIST_FOREACH(real_service, &vs->real_services, next) {
+        if (real_service->flags & LB_RS_F_AVAILABLE)
+            break;
+    }
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-        rr->real_services[lcore_id] = LIST_FIRST(&vs->real_services);
+        rr->real_services[lcore_id] = real_service;
     }
     return 0;
 }

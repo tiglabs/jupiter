@@ -1183,8 +1183,9 @@ del_sched:
     VS_TBL_FOREACH_SOCKET(socket_id) {
         LB_VS_WLOCK(vss[socket_id]);
         if (rss[socket_id]->flags & LB_RS_F_AVAILABLE) {
-            vss[socket_id]->sched->del(vss[socket_id], rss[socket_id]);
             LIST_REMOVE(rss[socket_id], next);
+            rss[socket_id]->flags &= ~LB_RS_F_AVAILABLE;
+            vss[socket_id]->sched->del(vss[socket_id], rss[socket_id]);
         }
         LB_VS_WUNLOCK(vss[socket_id]);
     }
@@ -1255,11 +1256,11 @@ rs_del_cmd_cb(int fd, char *argv[], int argc) {
             continue;
 
         LB_VS_WLOCK(vss[socket_id]);
+        LIST_REMOVE(rs, next);
         if (rs->flags & LB_RS_F_AVAILABLE) {
             rs->flags &= ~LB_RS_F_AVAILABLE;
             vss[socket_id]->sched->del(vss[socket_id], rs);
         }
-        LIST_REMOVE(rs, next);
         LB_VS_WUNLOCK(vss[socket_id]);
 
         lb_rs_free(rs);
